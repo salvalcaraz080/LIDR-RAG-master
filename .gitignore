@@ -1,6 +1,27 @@
+# Environment variables
 .env
-.venv/
+
+# Python
 __pycache__/
 *.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
 debug.py
+
+# Virtual environments
+.venv/
+venv/
+
+# Testing / linting caches
+.pytest_cache/
+.ruff_cache/
+
+# OS files
+.DS_Store
+
+# IDEs
+.idea/
 .vscode/
+COMMANDS.md
