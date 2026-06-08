@@ -30,3 +30,30 @@ services:
       timeout: 5s
       start_period: 10s
       retries: 3
+
+  frontend:
+      build:
+        context: .
+        dockerfile: frontend/Dockerfile
+      container_name: frontend
+      ports:
+        - "8501:8501"
+
+      # BACKEND_URL overrides the default to use the Compose service name.
+      # Actually the default IS http://estimator:8000, so this is redundant —
+      # but explicit is better than implicit for the next person reading this.
+      environment:
+        - BACKEND_URL=http://estimator:8000
+
+      # Hot-reload: mount frontend source so code changes reflect without rebuild.
+      # Mirrors the backend's bind-mount strategy.
+      volumes:
+        - ./frontend:/app/frontend
+
+      # Don't start the frontend until the backend is healthy. Without this,
+      # Streamlit could come up first and its first request would fail.
+      depends_on:
+        estimator:
+          condition: service_healthy
+
+      restart: unless-stopped
