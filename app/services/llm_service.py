@@ -1,16 +1,12 @@
 import structlog
-from litellm import completion, get_llm_provider
 
 from app.config import get_settings
 from app.context.examples import ESTIMATION_EXAMPLES, format_examples_for_prompt
+from app.services import llm_wrapper
 
 log = structlog.get_logger()
 
-MAX_TOKENS = 4000
-
-
-class LLMServiceError(Exception):
-    """Raised when the LLM provider call fails."""
+MAX_TOKENS = 4000  # domain decision: estimations fit comfortably under this
 
 
 def build_system_prompt() -> str:
@@ -38,73 +34,34 @@ def build_system_prompt() -> str:
 
 
 def _build_messages(transcription: str) -> list[dict]:
-    """Assemble the chat messages shared by streaming and non-streaming calls."""
+    """Assemble the chat messages — domain-specific structure."""
     return [
         {"role": "system", "content": build_system_prompt()},
         {"role": "user", "content": transcription},
     ]
 
 
-def _resolve_provider(model: str) -> str:
-    """Infer the provider label from the model name for logging/metadata.
+def generate_estimation(transcription: str) -> dict:
+    """Non-streaming: full estimation in one object. For programmatic consumers."""
+    model = get_settings().LLM_MODEL
+    messages = _build_messages(transcription)
 
-    LiteLLM infers the provider from its model registry. Known aliases
-    ('gpt-4o-mini', 'claude-haiku-4-5') resolve directly; for unmapped names
-    use the explicit 'provider/model' form. Defensive: never crash on a name
-    LiteLLM can't map — the provider label is metadata, not control flow.
-    """
-    try:
-        return get_llm_provider(model=model)[1]
-    except Exception:
-        return "unknown"
+    log.info("generating_estimation", model=model)
+    result = llm_wrapper.complete(messages, model, max_tokens=MAX_TOKENS)
+
+    # Map the wrapper's generic 'content' to the domain term 'estimation'.
+    return {
+        "estimation": result["content"],
+        "model": result["model"],
+        "provider": result["provider"],
+        "usage": result["usage"],
+    }
 
 
 def generate_estimation_stream(transcription: str):
-    """Generate a software estimation as a stream of typed events (provider-agnostic).
-
-    Yields dicts of two shapes:
-      - {"type": "token", "data": str}      → a text fragment, many of these
-      - {"type": "done", "metadata": dict}  → final event with model/usage info
-    """
-    settings = get_settings()
-    model = settings.LLM_MODEL
+    """Streaming: yields the wrapper's typed events. For conversational UIs."""
+    model = get_settings().LLM_MODEL
     messages = _build_messages(transcription)
-    provider = _resolve_provider(model)
 
-    log.info("generating_estimation_stream", model=model, provider=provider)
-
-    try:
-        stream = completion(
-            model=model,
-            messages=messages,
-            max_tokens=MAX_TOKENS,
-            stream=True,
-            stream_options={"include_usage": True},  
-        )
-
-        for chunk in stream:
-            # Final usage-only chunk: no text, usage populated.
-            usage = getattr(chunk, "usage", None)
-            if usage is not None:
-                yield {
-                    "type": "done",
-                    "metadata": {
-                        "model": model,
-                        "provider": provider,
-                        "usage": {
-                            "input_tokens": usage.prompt_tokens,
-                            "output_tokens": usage.completion_tokens,
-                            "total_tokens": usage.total_tokens,
-                        },
-                    },
-                }
-                continue
-
-            # Normal content chunk. LiteLLM mirrors OpenAI's structure for all providers.
-            delta = chunk.choices[0].delta.content
-            if delta:
-                yield {"type": "token", "data": delta}
-
-    except Exception as exc:
-        log.error("llm_stream_failed", error=str(exc), model=model)
-        raise LLMServiceError(f"LLM streaming call failed: {exc}") from exc
+    log.info("generating_estimation_stream", model=model)
+    yield from llm_wrapper.stream(messages, model, max_tokens=MAX_TOKENS)
