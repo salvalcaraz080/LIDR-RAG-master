@@ -9,12 +9,7 @@ class LLMError(Exception):
 
 
 def _resolve_provider(model: str) -> str:
-    """Infer the provider label from the model name (for logging/metadata).
-
-    Defensive: a provider label is metadata, not control flow — never crash
-    on a name LiteLLM can't map. Use the explicit 'provider/model' form for
-    names outside LiteLLM's registry.
-    """
+    """Infer the provider label from the model name (for logging/metadata)."""
     try:
         return get_llm_provider(model=model)[1]
     except Exception:

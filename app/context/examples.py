@@ -136,15 +136,3 @@ ESTIMATION_EXAMPLES: list[dict] = [
 **12 weeks** with a three-person core development team.""",
     },
 ]
-
-
-def format_examples_for_prompt(examples: list[dict]) -> str:
-    """Format estimation examples into a string suitable for injection into a system prompt."""
-    parts: list[str] = []
-    for i, example in enumerate(examples, start=1):
-        parts.append(
-            f"--- EXAMPLE {i} ---\n"
-            f"Meeting Summary:\n{example['meeting_summary']}\n\n"
-            f"Estimation:\n{example['estimation']}\n"
-        )
-    return "\n".join(parts)

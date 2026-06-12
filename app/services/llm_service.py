@@ -1,7 +1,7 @@
 import structlog
 
 from app.config import get_settings
-from app.context.examples import ESTIMATION_EXAMPLES, format_examples_for_prompt
+from app.context.examples import ESTIMATION_EXAMPLES
 from app.services import llm_wrapper
 
 log = structlog.get_logger()
@@ -31,6 +31,18 @@ def build_system_prompt() -> str:
         "numbers.\n\n"
         f"{examples_text}"
     )
+
+
+def format_examples_for_prompt(examples: list[dict]) -> str:
+    """Format estimation examples into a string suitable for injection into a system prompt."""
+    parts: list[str] = []
+    for i, example in enumerate(examples, start=1):
+        parts.append(
+            f"--- EXAMPLE {i} ---\n"
+            f"Meeting Summary:\n{example['meeting_summary']}\n\n"
+            f"Estimation:\n{example['estimation']}\n"
+        )
+    return "\n".join(parts)
 
 
 def _build_messages(transcription: str) -> list[dict]:
@@ -65,3 +77,5 @@ def generate_estimation_stream(transcription: str):
 
     log.info("generating_estimation_stream", model=model)
     yield from llm_wrapper.stream(messages, model, max_tokens=MAX_TOKENS)
+
+
