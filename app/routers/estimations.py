@@ -15,7 +15,7 @@ router = APIRouter(prefix="/api/v1", tags=["estimations"])
 async def create_estimation(request: EstimationRequest) -> EstimationResponse:
     """Non-streaming estimation — full structured response for programmatic callers."""
     try:
-        result = generate_estimation(request.transcription)
+        result = await generate_estimation(request.transcription)
     except LLMError as exc:
         log.error("estimation_endpoint_error", error=str(exc))
         raise HTTPException(status_code=500, detail=str(exc))
@@ -26,7 +26,7 @@ async def create_estimation(request: EstimationRequest) -> EstimationResponse:
 async def create_estimation_stream(request: EstimationRequest):
     """Streaming estimation as SSE — for conversational UIs."""
     try:
-        for event in generate_estimation_stream(request.transcription):
+        async for event in generate_estimation_stream(request.transcription):
             if event["type"] == "token":
                 yield ServerSentEvent(data=event["data"], event="token")
             elif event["type"] == "done":

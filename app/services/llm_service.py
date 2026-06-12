@@ -53,15 +53,14 @@ def _build_messages(transcription: str) -> list[dict]:
     ]
 
 
-def generate_estimation(transcription: str) -> dict:
+async def generate_estimation(transcription: str) -> dict:
     """Non-streaming: full estimation in one object. For programmatic consumers."""
     model = get_settings().LLM_MODEL
     messages = _build_messages(transcription)
 
     log.info("generating_estimation", model=model)
-    result = llm_wrapper.complete(messages, model, max_tokens=MAX_TOKENS)
+    result = await llm_wrapper.complete(messages, model, max_tokens=MAX_TOKENS)
 
-    # Map the wrapper's generic 'content' to the domain term 'estimation'.
     return {
         "estimation": result["content"],
         "model": result["model"],
@@ -70,12 +69,11 @@ def generate_estimation(transcription: str) -> dict:
     }
 
 
-def generate_estimation_stream(transcription: str):
-    """Streaming: yields the wrapper's typed events. For conversational UIs."""
+async def generate_estimation_stream(transcription: str):
+    """Streaming: async generator of typed events. For conversational UIs."""
     model = get_settings().LLM_MODEL
     messages = _build_messages(transcription)
 
     log.info("generating_estimation_stream", model=model)
-    yield from llm_wrapper.stream(messages, model, max_tokens=MAX_TOKENS)
-
-
+    async for event in llm_wrapper.stream(messages, model, max_tokens=MAX_TOKENS):
+        yield event

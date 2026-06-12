@@ -1,5 +1,5 @@
 import structlog
-from litellm import completion, get_llm_provider
+from litellm import acompletion, get_llm_provider
 
 log = structlog.get_logger()
 
@@ -16,16 +16,13 @@ def _resolve_provider(model: str) -> str:
         return "unknown"
 
 
-def complete(messages: list[dict], model: str, max_tokens: int) -> dict:
-    """Single-shot completion. Returns a normalized dict (provider-agnostic).
-
-    Knows nothing about estimations — speaks only 'messages in, content out'.
-    """
+async def complete(messages: list[dict], model: str, max_tokens: int) -> dict:
+    """Single-shot async completion. Returns a normalized dict."""
     provider = _resolve_provider(model)
     log.info("llm_call_started", model=model, provider=provider, stream=False)
 
     try:
-        response = completion(model=model, messages=messages, max_tokens=max_tokens)
+        response = await acompletion(model=model, messages=messages, max_tokens=max_tokens)
     except Exception as exc:
         log.error("llm_call_failed", error=str(exc), model=model)
         raise LLMError(f"LLM call failed: {exc}") from exc
@@ -51,20 +48,13 @@ def complete(messages: list[dict], model: str, max_tokens: int) -> dict:
     }
 
 
-def stream(messages: list[dict], model: str, max_tokens: int):
-    """Streaming completion. Yields transport-agnostic typed events:
-
-      - {"type": "token", "data": str}      → text fragment, many of these
-      - {"type": "done", "metadata": dict}  → final event with model/usage
-
-    Raises LLMError on failure (possibly mid-stream); the caller decides how
-    to surface it (the router turns it into an SSE 'error' event).
-    """
+async def stream(messages: list[dict], model: str, max_tokens: int):
+    """Async streaming completion. Yields transport-agnostic typed events."""
     provider = _resolve_provider(model)
     log.info("llm_call_started", model=model, provider=provider, stream=True)
 
     try:
-        response = completion(
+        response = await acompletion(
             model=model,
             messages=messages,
             max_tokens=max_tokens,
@@ -72,7 +62,7 @@ def stream(messages: list[dict], model: str, max_tokens: int):
             stream_options={"include_usage": True},
         )
 
-        for chunk in response:
+        async for chunk in response:
             usage = getattr(chunk, "usage", None)
             if usage is not None:
                 yield {
