@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     LLM_MODEL: str = "openai/gpt-4o-mini"
     APP_ENV: str = "development"
     LOG_LEVEL: str = "DEBUG"
+    REDIS_URL: str = "redis://redis:6379"
 
 
 @lru_cache

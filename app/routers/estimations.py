@@ -1,7 +1,9 @@
+import redis.asyncio as aredis
 import structlog
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.sse import EventSourceResponse, ServerSentEvent
 
+from app.dependencies import get_redis
 from app.schemas.estimations import EstimationRequest, EstimationResponse
 from app.services.llm_service import generate_estimation, generate_estimation_stream
 from app.services.llm_wrapper import LLMError
@@ -10,12 +12,16 @@ log = structlog.get_logger()
 
 router = APIRouter(prefix="/api/v1", tags=["estimations"])
 
-
 @router.post("/estimate", response_model=EstimationResponse)
-async def create_estimation(request: EstimationRequest) -> EstimationResponse:
+async def create_estimation(
+    request: EstimationRequest,
+    redis: aredis.Redis = Depends(get_redis),
+) -> EstimationResponse:
     """Non-streaming estimation — full structured response for programmatic callers."""
+
+    
     try:
-        result = await generate_estimation(request.transcription)
+        result = await generate_estimation(request.transcription, redis)
     except LLMError as exc:
         log.error("estimation_endpoint_error", error=str(exc))
         raise HTTPException(status_code=500, detail=str(exc))

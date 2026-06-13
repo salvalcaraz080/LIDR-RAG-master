@@ -1,7 +1,9 @@
+import redis.asyncio as aredis
 import structlog
 
 from app.config import get_settings
 from app.context.examples import ESTIMATION_EXAMPLES
+from app.services import cache
 from app.services import llm_wrapper
 
 log = structlog.get_logger()
@@ -53,13 +55,13 @@ def _build_messages(transcription: str) -> list[dict]:
     ]
 
 
-async def generate_estimation(transcription: str) -> dict:
+async def generate_estimation(transcription: str, redis: aredis.Redis) -> dict:
     """Non-streaming: full estimation in one object. For programmatic consumers."""
     model = get_settings().LLM_MODEL
     messages = _build_messages(transcription)
 
     log.info("generating_estimation", model=model)
-    result = await llm_wrapper.complete(messages, model, max_tokens=MAX_TOKENS)
+    result = await cache.cached_complete(messages, model, MAX_TOKENS, redis)
 
     return {
         "estimation": result["content"],
