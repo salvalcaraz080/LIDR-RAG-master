@@ -39,7 +39,7 @@ El proyecto separa responsabilidades de forma estricta. Respetar esta separació
 - `app/services/` — lógica de negocio: construcción del prompt, caché, llamada al LLM, postprocesamiento.
   - `llm_service.py` — orquesta la estimación: construye el prompt, llama a `cache`, mapea el resultado al dominio.
   - `cache.py` — capa de caché Redis sobre `llm_wrapper.complete`. Cache-aside: miss → LLM → write. Fallos de Redis se degradan a miss (no fatales).
-  - `llm_wrapper.py` — adaptador LLM agnóstico de dominio. Habla litellm (`acompletion`). Expone `complete` (one-shot async) y `stream` (async generator de eventos tipados).
+  - `llm_wrapper.py` — adaptador LLM agnóstico de dominio. Gestiona un LiteLLM Router singleton con fallback automático OpenAI → Anthropic. Expone `complete` (one-shot async) y `stream` (async generator de eventos tipados). El modelo primario se lee de `LLM_MODEL` en config; el secundario (`claude-haiku-4-5`) está fijo como infraestructura.
 - `app/schemas/` — contratos Pydantic (request/response). Son el borde HTTP, no el núcleo.
 - `app/context/` — datos de referencia estáticos para CAG. Punto de sustitución futuro para RAG.
 - `app/dependencies.py` — dependency providers de FastAPI (`get_redis`: extrae el cliente Redis de `app.state`).
@@ -62,7 +62,7 @@ Router → valida EstimationRequest
            → cache.cached_complete(messages, model, max_tokens, redis)
                → hit:  devuelve resultado cacheado
                → miss: llm_wrapper.complete → guarda en Redis → devuelve
-           → mapea a dict plano {estimation, model, provider, usage}
+           → mapea a dict plano {estimation, model, provider, usage, cache_hit}
        → EstimationResponse(**result)  ← validación Pydantic en el borde
 ```
 
