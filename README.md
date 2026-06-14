@@ -53,9 +53,17 @@ uv run uvicorn app.main:app --reload
 curl -X POST http://localhost:8000/api/v1/estimate \
   -H "Content-Type: application/json" \
   -d '{
-    "transcription": "The client wants to build a mobile app for managing restaurant reservations. They need user registration, a restaurant search with filters by cuisine and location, a real-time reservation system with availability checking, push notifications for reservation confirmations and reminders, and an admin panel for restaurant owners to manage their listings and view analytics."
+    "description": "The client wants to build a mobile app for managing restaurant reservations. They need user registration, a restaurant search with filters by cuisine and location, a real-time reservation system with availability checking, push notifications for reservation confirmations and reminders, and an admin panel for restaurant owners to manage their listings and view analytics.",
+    "project_type": "mobile_app",
+    "detail_level": "detailed",
+    "output_format": "phases_table"
   }'
 ```
+
+El cuerpo de la petición usa parámetros tipados (Enums): `project_type`
+(`mobile_app` · `web_saas` · `internal_tool` · `data_pipeline`), `detail_level`
+(`summary` · `medium` · `detailed`) y `output_format` (`phases_table` ·
+`line_items` · `narrative`). `description` requiere entre 20 y 2000 caracteres.
 
 ## Estructura del proyecto
 
@@ -68,10 +76,13 @@ estimator/
 │   │   └── estimations.py  # Endpoint POST /api/v1/estimate
 │   ├── services/
 │   │   └── llm_service.py  # Logica de negocio, llamadas al LLM
+│   ├── prompts/
+│   │   ├── loader.py       # Render de templates Jinja2 versionados
+│   │   └── estimation/v1/  # system.j2, user.j2, examples.j2
 │   ├── schemas/
-│   │   └── estimation.py   # Modelos Pydantic (request/response)
+│   │   └── estimations.py  # Modelos Pydantic (request/response)
 │   └── context/
-│       └── examples.py     # Ejemplos de estimacion (contexto CAG)
+│       └── examples.py     # Ejemplos de referencia (obsoleto en CAG, vuelve en RAG)
 ├── tests/
 │   └── test_health.py      # Tests basicos
 ├── Dockerfile              # Build multi-stage con uv

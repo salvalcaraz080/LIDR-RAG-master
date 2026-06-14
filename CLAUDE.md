@@ -5,6 +5,8 @@ API REST construida con FastAPI. Parte del máster LIDR RAG & Agentes; evolucion
 
 ## Comandos
 
+> Cuando des comandos, recuerda que la consola es **Powershell**. Adapta la sintaxis.
+
 ```bash
 # Arrancar servidor en local (desarrollo)
 uv run uvicorn app.main:app --reload
@@ -37,11 +39,12 @@ El proyecto separa responsabilidades de forma estricta. Respetar esta separació
 
 - `app/routers/` — endpoints HTTP. Reciben, validan, **delegan**, devuelven. SIN lógica de negocio.
 - `app/services/` — lógica de negocio: construcción del prompt, caché, llamada al LLM, postprocesamiento.
-  - `llm_service.py` — orquesta la estimación: construye el prompt, llama a `cache`, mapea el resultado al dominio.
+  - `llm_service.py` — orquesta la estimación: pide el prompt al loader, llama a `cache`, mapea el resultado al dominio. Recibe primitivas tipadas (`description`, `project_type`, `detail_level`, `output_format`), no el schema.
   - `cache.py` — capa de caché Redis sobre `llm_wrapper.complete`. Cache-aside: miss → LLM → write. Fallos de Redis se degradan a miss (no fatales).
   - `llm_wrapper.py` — adaptador LLM agnóstico de dominio. Gestiona un LiteLLM Router singleton con fallback automático OpenAI → Anthropic. Expone `complete` (one-shot async) y `stream` (async generator de eventos tipados). El modelo primario se lee de `LLM_MODEL` en config; el secundario (`claude-haiku-4-5`) está fijo como infraestructura.
-- `app/schemas/` — contratos Pydantic (request/response). Son el borde HTTP, no el núcleo.
-- `app/context/` — datos de referencia estáticos para CAG. Punto de sustitución futuro para RAG.
+- `app/prompts/` — prompts versionados en templates Jinja2 (delimitadores Markdown). `loader.py` (`render_estimation_prompt`) renderiza `estimation/v1/{system.j2, user.j2, examples.j2}` y devuelve la tupla `(system, user)`. Recibe primitivas tipadas para mantenerse desacoplado del borde HTTP. `StrictUndefined`: toda variable del template debe estar en el contexto.
+- `app/schemas/` — contratos Pydantic (request/response) con Enums tipados. Son el borde HTTP, no el núcleo.
+- `app/context/` — datos de referencia estáticos. **Obsoleto en la fase CAG actual** (los ejemplos few-shot viven en `prompts/estimation/v1/examples.j2`); se reintroduce como fuente de datos en el módulo RAG.
 - `app/dependencies.py` — dependency providers de FastAPI (`get_redis`: extrae el cliente Redis de `app.state`).
 - `app/logging_config.py` — configura structlog una vez al arrancar. Console en dev, JSON en producción. Driven por `APP_ENV` y `LOG_LEVEL`.
 - `app/config.py` — `BaseSettings` de Pydantic, cacheado con `@lru_cache`.
@@ -55,10 +58,11 @@ El proyecto separa responsabilidades de forma estricta. Respetar esta separació
 ## Flujo de una request (`POST /api/v1/estimate`)
 
 ```
-Router → valida EstimationRequest
-       → inject redis (Depends)
-       → llm_service.generate_estimation(transcription, redis)
-           → construye mensajes (system prompt + ejemplos CAG + transcripción)
+Router → valida EstimationRequest (description + project_type/detail_level/output_format)
+       → desempaqueta el schema en primitivas + inject redis (Depends)
+       → llm_service.generate_estimation(description, project_type, detail_level, output_format, redis)
+           → render_estimation_prompt(...) → (system, user)  ← templates Jinja2 v1
+           → messages = [system, user]
            → cache.cached_complete(messages, model, max_tokens, redis)
                → hit:  devuelve resultado cacheado
                → miss: llm_wrapper.complete → guarda en Redis → devuelve
@@ -71,7 +75,8 @@ El endpoint `/estimate/stream` **no usa caché** (ver Pendientes).
 ## Convenciones del proyecto
 
 - **El servicio devuelve dicts planos, no instancia los schemas Pydantic.** Mantiene el núcleo de negocio agnóstico del borde HTTP. La validación contra los schemas ocurre en el router.
-- **El formateo de ejemplos para el prompt vive en `llm_service.py`, no en `context/`.** Razón: cuando se migre a RAG, los datos vendrán de la BD vectorial pero el formato lo seguirá construyendo el servicio.
+- **El prompt vive en templates Jinja2 versionados (`app/prompts/`), no en f-strings del servicio.** El servicio pide el render al loader y solo arma `messages`. Razón: separar contenido del prompt (versionable) de la orquestación.
+- **El loader recibe primitivas tipadas, no `EstimationRequest`.** Mantiene la capa de prompts desacoplada del borde HTTP, igual que el servicio devuelve dicts. El router es el único que toca el schema.
 - **Cliente LLM asíncrono** (`litellm.acompletion` + `await`). No usar el cliente síncrono dentro de funciones `async`.
 - El archivo de schemas es `app/schemas/estimations.py` (plural). El import correcto es `from app.schemas.estimations import ...`.
 - **Imports ordenados:** stdlib → terceros → locales (una línea en blanco entre grupos).

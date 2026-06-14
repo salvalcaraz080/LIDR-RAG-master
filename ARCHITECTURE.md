@@ -22,6 +22,7 @@ tanto *qué hace* como *por qué está construido así*.
    - [5.1 `llm_service` — orquestación](#51-llm_service--orquestación-del-dominio)
    - [5.2 `cache` — caché Redis](#52-cache--caché-cache-aside-sobre-redis)
    - [5.3 `llm_wrapper` — adaptador LLM](#53-llm_wrapper--adaptador-llm-agnóstico-de-dominio)
+   - [5.4 `prompts` — templates Jinja2](#54-prompts--templates-jinja2-versionados)
 6. [Context — datos CAG](#6-context--datos-de-referencia-cag)
 7. [Infraestructura transversal](#7-infraestructura-transversal)
    - [7.1 Configuración](#71-configuración-appconfigpy)
@@ -46,17 +47,17 @@ flowchart TB
     user([👤 Usuario])
 
     subgraph frontend["🖥️ Frontend · Streamlit :8501"]
-        ui[streamlit_app.py<br/>chat + write_stream]
+        ui[streamlit_app.py<br/>formulario + write_stream]
     end
 
     subgraph backend["⚙️ Backend · FastAPI :8000"]
         direction TB
         router["routers/estimations.py<br/>borde HTTP · valida · delega"]
-        schema["schemas/estimations.py<br/>contratos Pydantic"]
+        schema["schemas/estimations.py<br/>contratos Pydantic · Enums"]
         service["services/llm_service.py<br/>orquestación del dominio"]
+        prompts["prompts/loader.py<br/>templates Jinja2 v1"]
         cache["services/cache.py<br/>caché cache-aside"]
         wrapper["services/llm_wrapper.py<br/>adaptador LLM · litellm Router"]
-        context["context/examples.py<br/>ejemplos de referencia CAG"]
     end
 
     subgraph infra["🔧 Infraestructura transversal"]
@@ -71,7 +72,7 @@ flowchart TB
     ui -->|"POST /estimate/stream (SSE)"| router
     router -->|"valida con"| schema
     router -->|"delega a"| service
-    service -->|"lee ejemplos"| context
+    service -->|"render (system, user)"| prompts
     service -->|"non-stream"| cache
     service -->|"stream"| wrapper
     cache <-->|"get / set"| redis
@@ -89,11 +90,12 @@ flowchart TB
 
 | Capa | Archivo(s) | Responsabilidad | Lo que **NO** hace |
 |------|-----------|-----------------|--------------------|
-| **Frontend** | `frontend/streamlit_app.py` | UI conversacional, consume el stream SSE, pinta tokens en vivo | No habla con el LLM ni conoce su API |
+| **Frontend** | `frontend/streamlit_app.py` | Formulario de producto (descripción + parámetros tipados), consume el stream SSE, pinta tokens en vivo | No habla con el LLM ni conoce su API |
 | **Routers** | `app/routers/estimations.py` | Recibe HTTP, valida, **delega**, traduce errores a códigos HTTP | Sin lógica de negocio |
-| **Schemas** | `app/schemas/estimations.py` | Contrato Pydantic request/response — el borde HTTP | No es el núcleo del dominio |
-| **Services** | `app/services/*.py` | Lógica de negocio: prompt, caché, llamada LLM, post-proceso | No conoce HTTP |
-| **Context** | `app/context/examples.py` | Datos de referencia estáticos para CAG | No formatea el prompt |
+| **Schemas** | `app/schemas/estimations.py` | Contrato Pydantic request/response (Enums tipados) — el borde HTTP | No es el núcleo del dominio |
+| **Services** | `app/services/*.py` | Lógica de negocio: orquestación, caché, llamada LLM, post-proceso | No conoce HTTP |
+| **Prompts** | `app/prompts/` | Templates Jinja2 versionados + loader; renderiza `(system, user)` | No conoce HTTP ni el LLM |
+| **Context** | `app/context/examples.py` | Datos de referencia (obsoleto en CAG; vuelve en RAG) | No formatea el prompt |
 | **Infra** | `config`, `dependencies`, `logging_config`, `main` | Configuración, DI, logging, ciclo de vida | No es lógica de dominio |
 
 ### Principio rector: dirección de las dependencias
@@ -103,7 +105,7 @@ El flujo de control siempre va **de fuera hacia dentro**, y las dependencias nun
 ```
 Frontend → Router → Service → Cache → Wrapper → Proveedor LLM
                        │
-                       └─→ Context (datos CAG)
+                       └─→ Prompts (loader + templates Jinja2)
 ```
 
 - El **núcleo de negocio (services) es agnóstico del borde HTTP**: devuelve `dict` planos, no
@@ -116,15 +118,16 @@ Frontend → Router → Service → Cache → Wrapper → Proveedor LLM
 ## 2. Frontend — Streamlit (capa de presentación)
 
 Aplicación Streamlit independiente ([`frontend/streamlit_app.py`](frontend/streamlit_app.py)) que
-ofrece una interfaz de chat. Es un **servicio separado** del backend: su propio contenedor, su propio
-grupo de dependencias (`requests`, `sseclient-py`, `streamlit`) y **cero acoplamiento** con el código
-de `app/`.
+ofrece una **interfaz de formulario de producto** (descripción + parámetros tipados), no un chat libre.
+Es un **servicio separado** del backend: su propio contenedor, su propio grupo de dependencias
+(`requests`, `sseclient-py`, `streamlit`) y **cero acoplamiento** con el código de `app/`.
 
 ### Responsabilidades
 
-- Mantener el historial de conversación en `st.session_state` (sobrevive a los *re-runs* completos de
-  script que hace Streamlit en cada interacción).
-- Validar longitud mínima de la transcripción (50 caracteres) **antes** de llamar al backend.
+- Presentar un `st.form` con el campo `description` y tres selectores (`project_type`, `detail_level`,
+  `output_format`). Los labels son legibles, pero el valor enviado es **exactamente** el value del Enum
+  del backend (case-sensitive — el backend corre en Linux).
+- Validar longitud mínima de la descripción (20 caracteres) **antes** de llamar al backend.
 - Consumir el endpoint de **streaming** vía SSE y pintar los tokens en vivo con `st.write_stream`.
 
 ### Patrón clave: puente SSE → `write_stream`
@@ -140,10 +143,10 @@ sequenceDiagram
     participant G as token_stream()<br/>(generador puente)
     participant B as Backend /estimate/stream
 
-    U->>S: escribe transcripción
-    S->>S: valida longitud ≥ 50
+    U->>S: rellena formulario (description + params)
+    S->>S: valida longitud ≥ 20
     S->>G: st.write_stream(token_stream())
-    G->>B: POST (stream=True, Accept: text/event-stream)
+    G->>B: POST {description, project_type, detail_level, output_format}<br/>(stream=True, Accept: text/event-stream)
     loop por cada evento SSE
         B-->>G: event: token / done / error
         alt token
@@ -194,18 +197,24 @@ traduce el resultado/errores a HTTP. **No contiene lógica de negocio.**
 @router.post("/estimate", response_model=EstimationResponse)
 async def create_estimation(request: EstimationRequest, redis = Depends(get_redis)):
     try:
-        result = await generate_estimation(request.transcription, redis)  # delega
+        result = await generate_estimation(                              # desempaqueta el schema
+            request.description, request.project_type.value,
+            request.detail_level.value, request.output_format.value, redis,
+        )
     except LLMError as exc:
         raise HTTPException(status_code=500, detail=str(exc))             # traduce error
     return EstimationResponse(**result)                                   # valida en el borde
 ```
 
-Tres detalles arquitectónicos importantes:
+Cuatro detalles arquitectónicos importantes:
 
-1. **Inyección de Redis vía `Depends(get_redis)`** — el router no construye el cliente, lo recibe.
-2. **`LLMError → HTTPException(500)`** — la excepción de dominio del wrapper se traduce a HTTP
+1. **El router es el único que toca el schema** — desempaqueta `EstimationRequest` en primitivas
+   (`.value` de cada Enum) antes de delegar. El servicio y la capa de prompts reciben primitivas, no
+   el contrato HTTP.
+2. **Inyección de Redis vía `Depends(get_redis)`** — el router no construye el cliente, lo recibe.
+3. **`LLMError → HTTPException(500)`** — la excepción de dominio del wrapper se traduce a HTTP
    *solo aquí*. El servicio nunca conoce códigos HTTP.
-3. **`EstimationResponse(**result)`** — la validación Pydantic ocurre en el borde, sobre el `dict`
+4. **`EstimationResponse(**result)`** — la validación Pydantic ocurre en el borde, sobre el `dict`
    plano que devuelve el servicio.
 
 El endpoint de stream traduce los eventos tipados del servicio (`token` / `done`) a `ServerSentEvent`,
@@ -221,7 +230,10 @@ es `from app.schemas.estimations import ...`). Define el **contrato HTTP**, no e
 ```mermaid
 classDiagram
     class EstimationRequest {
-        +str transcription (min_length=50)
+        +str description (20..2000)
+        +ProjectType project_type
+        +DetailLevel detail_level
+        +OutputFormat output_format
     }
     class EstimationResponse {
         +str estimation (markdown)
@@ -238,8 +250,10 @@ classDiagram
     EstimationResponse --> TokenUsage
 ```
 
-- **`EstimationRequest`** — valida la entrada en el borde: `transcription` con `min_length=50`. Una
-  petición corta produce automáticamente un `422` antes de tocar la lógica de negocio.
+- **`EstimationRequest`** — valida la entrada en el borde: `description` (20–2000 caracteres) más tres
+  parámetros tipados como Enums (`ProjectType`, `DetailLevel`, `OutputFormat`). Una petición fuera de
+  rango o con un valor de Enum inválido produce automáticamente un `422` antes de tocar la lógica de
+  negocio. Estos parámetros, ya validados, son los que alimentan el render del prompt.
 - **`EstimationResponse`** — forma de la salida no-stream, incluido `cache_hit` (transparencia sobre
   si la respuesta vino de caché) y el desglose de `usage`.
 
@@ -256,22 +270,23 @@ dirección:
 ```mermaid
 flowchart LR
     subgraph services["app/services/"]
-        ls["llm_service.py<br/><b>orquesta el dominio</b><br/>prompt + mapeo a dominio"]
+        ls["llm_service.py<br/><b>orquesta el dominio</b><br/>render prompt + mapeo a dominio"]
         ca["cache.py<br/><b>caché cache-aside</b><br/>clave determinista + TTL"]
         lw["llm_wrapper.py<br/><b>adaptador LLM</b><br/>litellm Router + fallback"]
     end
-    ctx["context/examples.py"]
+    prompts["prompts/loader.py<br/>templates Jinja2 v1"]
 
     ls -->|"non-stream"| ca
     ls -->|"stream (sin caché)"| lw
-    ls -.->|"lee ejemplos"| ctx
+    ls -.->|"render (system, user)"| prompts
     ca -->|"miss → completa"| lw
     lw --> prov{{"OpenAI / Anthropic"}}
 ```
 
 Niveles de abstracción (de mayor a menor):
 
-- **`llm_service`** conoce el *dominio* (estimaciones, prompt, ejemplos CAG).
+- **`llm_service`** conoce el *dominio* (estimaciones); delega el contenido del prompt al loader.
+- **`prompts/loader`** conoce el *formato del prompt* (templates Jinja2 versionados), pero ni HTTP ni el LLM.
 - **`cache`** conoce el *patrón de caché* (clave, TTL, degradación), pero no el dominio.
 - **`llm_wrapper`** conoce el *proveedor LLM* (litellm, fallback), pero ni el dominio ni la caché.
 
@@ -280,15 +295,12 @@ Niveles de abstracción (de mayor a menor):
 [`app/services/llm_service.py`](app/services/llm_service.py). Es la **única capa que conoce el
 dominio "estimación"**. Responsabilidades:
 
-1. **Construir el system prompt** (`build_system_prompt`): define el rol ("senior software
-   consultant"), el formato de salida obligatorio (título H2, tabla de tareas, totales, equipo,
-   duración), las tarifas (62,50 €/h dev, 50 €/h diseño) e inyecta los ejemplos CAG.
-2. **Formatear los ejemplos** (`format_examples_for_prompt`). *Decisión consciente:* este formateo
-   vive aquí, **no** en `context/`. Razón: al migrar a RAG los datos vendrán de una BD vectorial,
-   pero el servicio seguirá siendo quien construya el formato del prompt.
-3. **Ensamblar los mensajes** (`_build_messages`): `system` (prompt + ejemplos) + `user`
-   (transcripción).
-4. **Mapear el resultado a un `dict` plano del dominio** `{estimation, model, provider, usage,
+1. **Pedir el prompt al loader** (`render_estimation_prompt`): el contenido del prompt (rol, reglas,
+   formato de salida, tarifas, ejemplos) ya **no se construye con f-strings aquí** — vive en los
+   templates Jinja2 versionados de `app/prompts/`. El servicio solo pasa las primitivas tipadas
+   (`description`, `project_type`, `detail_level`, `output_format`) y recibe la tupla `(system, user)`.
+2. **Ensamblar los mensajes** (`_build_messages`): `messages = [system, user]`.
+3. **Mapear el resultado a un `dict` plano del dominio** `{estimation, model, provider, usage,
    cache_hit}` — sin instanciar schemas Pydantic (mantiene el núcleo agnóstico del borde HTTP).
 
 Dos puntos de entrada según el modo:
@@ -369,27 +381,62 @@ flowchart LR
 `_resolve_provider` deduce el proveedor real (`get_llm_provider`) a partir del modelo que efectivamente
 respondió — relevante porque, con fallback, puede no ser el primario.
 
+### 5.4 `prompts` — templates Jinja2 versionados
+
+[`app/prompts/`](app/prompts/). El **contenido del prompt está separado de la orquestación**: vive en
+templates Jinja2 versionados en lugar de en f-strings dentro del servicio. Esto permite versionar e
+iterar el prompt sin tocar el código de negocio.
+
+```mermaid
+flowchart LR
+    svc["llm_service"] -->|"primitivas tipadas"| loader["loader.py<br/>render_estimation_prompt()"]
+    loader -->|"get_template + render"| tpls["estimation/v1/<br/>system.j2 · user.j2 · examples.j2"]
+    tpls -->|"(system, user)"| svc
+```
+
+- **`loader.render_estimation_prompt(description, project_type, detail_level, output_format, version="v1")`**
+  → devuelve la tupla `(system, user)`. Recibe **primitivas tipadas, no `EstimationRequest`**: la capa
+  de prompts queda desacoplada del borde HTTP, igual que el servicio devuelve `dict`.
+- **`Environment`** con `FileSystemLoader(PROMPTS_DIR)`, `trim_blocks` / `lstrip_blocks` y
+  **`StrictUndefined`**: si un template referencia una variable que no está en el contexto, falla en el
+  render en lugar de producir un prompt con huecos silenciosos.
+- **Delimitadores Markdown** (`## Section`), no XML: el sistema es **LLM-agnóstico** vía LiteLLM (sin
+  "proveedor principal"), y Markdown es el formato neutro mejor entendido por todos los proveedores.
+- **`system.j2`** define rol, reglas y tarifas; ramifica según `output_format` (los tres valores:
+  `phases_table`, `line_items`, `narrative`) y añade un bloque extra (assumptions + intervalo de
+  confianza) solo cuando `detail_level == "detailed"`. Termina con `{% include "…/examples.j2" %}`.
+- **`examples.j2`** contiene los ejemplos few-shot **literales en Markdown** (migrados desde
+  `context/examples.py`). En la fase CAG esta es la fuente de los ejemplos; en RAG vendrán de la BD
+  vectorial.
+- **Versionado por carpeta** (`v1/`): convivir varias versiones del prompt es cuestión de añadir `v2/`
+  y pasar `version="v2"`.
+
 ---
 
 ## 6. Context — datos de referencia CAG
 
 [`app/context/examples.py`](app/context/examples.py). Contiene `ESTIMATION_EXAMPLES`: una lista de
-estimaciones de referencia (resumen de reunión + estimación completa en markdown) que se inyectan en
-el system prompt. **Esto es el "Context-Augmented" de CAG**: en lugar de recuperar contexto de una BD
-vectorial (RAG), el contexto está **precargado estáticamente** y siempre acompaña a cada petición.
+estimaciones de referencia (resumen de reunión + estimación completa en markdown).
+
+> **Estado (deuda técnica).** En la fase CAG actual este módulo está **obsoleto**: los ejemplos
+> few-shot se han migrado, literales en Markdown, a `app/prompts/estimation/v1/examples.j2`. No se borra
+> a propósito — se reintroducirá como **fuente de datos** en el módulo RAG, cuando los ejemplos vengan de
+> una BD vectorial recuperados por similitud (entonces el loader renderizará lo recuperado en lugar de
+> texto fijo). La sección se conserva porque explica el "Context-Augmented" de CAG: el contexto
+> **precargado estáticamente** que acompaña a cada petición.
 
 ```mermaid
 flowchart LR
-    examples["context/examples.py<br/>ESTIMATION_EXAMPLES<br/>(3 ejemplos estáticos)"]
-    -->|"format_examples_for_prompt()"| prompt["system prompt"]
+    examples["examples.j2<br/>(3 ejemplos few-shot literales)"]
+    -->|"{% include %}"| prompt["system prompt"]
     -->|"few-shot"| llm{{LLM}}
 ```
 
 - Los ejemplos guían al modelo en **estructura, nivel de detalle y precios realistas** (few-shot
   learning).
 - Esta capa es el **punto de sustitución futuro para RAG**: cuando llegue, los datos vendrán de una BD
-  vectorial recuperados por similitud, pero la interfaz hacia el servicio (una lista de ejemplos) puede
-  mantenerse. Por eso el *formateo* vive en el servicio y no aquí.
+  vectorial recuperados por similitud y se renderizarán a través del loader, igual que hoy los ejemplos
+  literales del template.
 - Solo contiene **datos**; ninguna lógica.
 
 ---
@@ -447,11 +494,11 @@ inyectado donde haga falta, fácil de mockear en tests.
 
 El `@asynccontextmanager lifespan` en `main.py` gestiona recursos con vida igual a la de la app:
 
-- **Startup**: abre el cliente `redis.asyncio` desde `REDIS_URL` (conexión perezosa — real en el
+- **Startup**: abre el cliente `redis.asyncio` desde `REDIS_URL` (conexión lazy — real en el
   primer comando) y lo guarda en `app.state.redis`.
 - **Shutdown**: cierra limpiamente el pool de conexiones (`aclose()`).
 
-Esto garantiza un único pool de conexiones por proceso, creado/destruido en el momento correcto.
+Esto garantiza un único pool de conexiones por proceso, creado/cerrado en el momento adecuado.
 
 ### 7.4 Logging estructurado (structlog)
 
@@ -548,16 +595,17 @@ mismo patrón **multi-stage** con buenas prácticas:
 | **`llm_wrapper` agnóstico de dominio** | Permite cambiar de proveedor o reutilizar el adaptador sin tocar el negocio. |
 | **Caché degradable (no fuente de verdad)** | La disponibilidad del sistema no depende de Redis. |
 | **Fallback de proveedores vía litellm Router** | Resiliencia: si OpenAI cae, responde Anthropic, de forma transparente. |
-| **Formateo de ejemplos en el servicio, no en context** | Prepara la migración a RAG sin reescribir la capa de datos. |
+| **Prompt en templates Jinja2 versionados, no en f-strings** | Versionar e iterar el prompt sin tocar el código de negocio; loader desacoplado del borde HTTP. |
+| **Parámetros tipados (Enums) en vez de texto libre** | Entrada de producto validada en el borde; cada combinación produce un prompt distinto (y por tanto clave de caché distinta). |
 | **structlog + request_id** | Trazabilidad de extremo a extremo de cada petición. |
 
 ### Hoja de ruta (CAG → RAG → agentes)
 
-El proyecto está en fase **CAG**: el contexto (`context/examples.py`) está precargado estáticamente.
-El diseño anticipa la evolución:
+El proyecto está en fase **CAG**: los ejemplos few-shot están precargados estáticamente, literales en
+`prompts/estimation/v1/examples.j2`. El diseño anticipa la evolución:
 
-- **→ RAG**: `context/` se sustituye por recuperación desde una BD vectorial por similitud. El borde
-  del servicio (recibe una lista de ejemplos) puede mantenerse; el formateo ya vive en el servicio.
+- **→ RAG**: los ejemplos literales del template se sustituyen por recuperación desde una BD vectorial
+  por similitud, renderizados a través del mismo loader. `context/` se reactiva como fuente de datos.
 - **→ Agentes**: módulos posteriores del máster.
 
 ### Pendientes conocidos
