@@ -1,19 +1,21 @@
-# DEUDA TÉCNICA (sesion-04): este módulo queda obsoleto en la fase CAG actual.
-# Los ejemplos few-shot ahora viven literales en app/prompts/estimation/v1/examples.j2.
-# No se borra: se reintroducirá como fuente de datos en el módulo RAG, cuando los
-# ejemplos vengan de una BD vectorial en lugar de estar precargados estáticamente.
-ESTIMATION_EXAMPLES: list[dict] = [
-    {
-        "meeting_summary": (
-            "The client needs an inventory management web platform for a mid-size warehouse "
-            "operation. They want real-time stock tracking, automated reorder alerts when items "
-            "fall below a configurable threshold, a role-based access system (admin, warehouse "
-            "manager, viewer), CSV/Excel import and export of inventory data, and a dashboard "
-            "with key metrics (turnover rate, stock value, low-stock items). They already have "
-            "a PostgreSQL database running in AWS that we should integrate with. No mobile app "
-            "is needed — the warehouse team will use tablets with the web interface."
-        ),
-        "estimation": """\
+## Reference Examples
+
+Below are reference estimations from previous projects. Use them as a guide for
+structure, level of detail, and realistic pricing. Adapt the content to match the
+specific project described by the user.
+
+### Example 1 — Project Description
+
+The client needs an inventory management web platform for a mid-size warehouse
+operation. They want real-time stock tracking, automated reorder alerts when items
+fall below a configurable threshold, a role-based access system (admin, warehouse
+manager, viewer), CSV/Excel import and export of inventory data, and a dashboard
+with key metrics (turnover rate, stock value, low-stock items). They already have
+a PostgreSQL database running in AWS that we should integrate with. No mobile app
+is needed — the warehouse team will use tablets with the web interface.
+
+### Example 1 — Estimation
+
 ## Inventory Management Web Platform
 
 ### Task Breakdown
@@ -46,20 +48,21 @@ ESTIMATION_EXAMPLES: list[dict] = [
 
 ### Estimated Duration
 
-**10 weeks** with a two-person development team.""",
-    },
-    {
-        "meeting_summary": (
-            "A real estate agency wants a high-conversion landing page to capture leads for "
-            "luxury property listings. The page should feature a hero section with a video "
-            "background, a curated property gallery with filtering by price range and location, "
-            "a lead capture form, and client testimonials. All leads must be pushed in real-time "
-            "to their existing HubSpot CRM via the API. The design must be responsive, "
-            "mobile-first, and follow their brand guidelines (they will provide a Figma file). "
-            "They also want basic analytics integration with Google Tag Manager and Meta Pixel "
-            "for ad campaign tracking."
-        ),
-        "estimation": """\
+**10 weeks** with a two-person development team.
+
+### Example 2 — Project Description
+
+A real estate agency wants a high-conversion landing page to capture leads for
+luxury property listings. The page should feature a hero section with a video
+background, a curated property gallery with filtering by price range and location,
+a lead capture form, and client testimonials. All leads must be pushed in real-time
+to their existing HubSpot CRM via the API. The design must be responsive,
+mobile-first, and follow their brand guidelines (they will provide a Figma file).
+They also want basic analytics integration with Google Tag Manager and Meta Pixel
+for ad campaign tracking.
+
+### Example 2 — Estimation
+
 ## Real Estate Landing Page with CRM Integration
 
 ### Task Breakdown
@@ -90,19 +93,20 @@ ESTIMATION_EXAMPLES: list[dict] = [
 
 ### Estimated Duration
 
-**5 weeks** with a single frontend developer and part-time design support.""",
-    },
-    {
-        "meeting_summary": (
-            "A B2B startup is building a SaaS platform to manage software subscriptions for "
-            "SMEs. Core features include: user registration and company onboarding, a dashboard "
-            "showing all active subscriptions with renewal dates and monthly spend, the ability "
-            "to add/edit/cancel subscriptions, integration with Stripe for payment processing "
-            "and invoice generation, a notification system (email alerts 30/7/1 days before "
-            "renewal), and an admin panel to manage customer accounts. They want a REST API "
-            "with a React frontend. MVP scope — they plan to iterate after launch."
-        ),
-        "estimation": """\
+**5 weeks** with a single frontend developer and part-time design support.
+
+### Example 3 — Project Description
+
+A B2B startup is building a SaaS platform to manage software subscriptions for
+SMEs. Core features include: user registration and company onboarding, a dashboard
+showing all active subscriptions with renewal dates and monthly spend, the ability
+to add/edit/cancel subscriptions, integration with Stripe for payment processing
+and invoice generation, a notification system (email alerts 30/7/1 days before
+renewal), and an admin panel to manage customer accounts. They want a REST API
+with a React frontend. MVP scope — they plan to iterate after launch.
+
+### Example 3 — Estimation
+
 ## SaaS Subscription Management Platform (MVP)
 
 ### Task Breakdown
@@ -137,6 +141,4 @@ ESTIMATION_EXAMPLES: list[dict] = [
 
 ### Estimated Duration
 
-**12 weeks** with a three-person core development team.""",
-    },
-]
+**12 weeks** with a three-person core development team.

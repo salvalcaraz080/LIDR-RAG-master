@@ -1,4 +1,26 @@
+from enum import Enum
+
 from pydantic import BaseModel, Field
+
+
+class ProjectType(str, Enum):
+    mobile_app = "mobile_app"
+    web_saas = "web_saas"
+    internal_tool = "internal_tool"
+    data_pipeline = "data_pipeline"
+
+
+class DetailLevel(str, Enum):
+    summary = "summary"
+    medium = "medium"
+    detailed = "detailed"
+
+
+class OutputFormat(str, Enum):
+    phases_table = "phases_table"
+    line_items = "line_items"
+    narrative = "narrative"
+
 
 class TokenUsage(BaseModel):
     input_tokens: int
@@ -13,7 +35,13 @@ class EstimationResponse(BaseModel):
     usage: TokenUsage
     cache_hit: bool = Field(..., description="Whether the response was served from cache")
 
-class EstimationRequest(BaseModel):
-    """Incoming request containing a meeting transcription to estimate."""
 
-    transcription: str = Field(..., min_length=50, description="Meeting transcription text")
+class EstimationRequest(BaseModel):
+    """Incoming request: a project description plus typed estimation parameters."""
+
+    description: str = Field(
+        ..., min_length=20, max_length=2000, description="Project description to estimate"
+    )
+    project_type: ProjectType
+    detail_level: DetailLevel
+    output_format: OutputFormat

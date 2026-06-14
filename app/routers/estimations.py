@@ -19,9 +19,14 @@ async def create_estimation(
 ) -> EstimationResponse:
     """Non-streaming estimation — full structured response for programmatic callers."""
 
-    
     try:
-        result = await generate_estimation(request.transcription, redis)
+        result = await generate_estimation(
+            request.description,
+            request.project_type.value,
+            request.detail_level.value,
+            request.output_format.value,
+            redis,
+        )
     except LLMError as exc:
         log.error("estimation_endpoint_error", error=str(exc))
         raise HTTPException(status_code=500, detail=str(exc))
@@ -32,7 +37,12 @@ async def create_estimation(
 async def create_estimation_stream(request: EstimationRequest):
     """Streaming estimation as SSE — for conversational UIs."""
     try:
-        async for event in generate_estimation_stream(request.transcription):
+        async for event in generate_estimation_stream(
+            request.description,
+            request.project_type.value,
+            request.detail_level.value,
+            request.output_format.value,
+        ):
             if event["type"] == "token":
                 yield ServerSentEvent(data=event["data"], event="token")
             elif event["type"] == "done":
