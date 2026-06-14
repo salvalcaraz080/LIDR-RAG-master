@@ -68,6 +68,7 @@ async def generate_estimation(transcription: str, redis: aredis.Redis) -> dict:
         "model": result["model"],
         "provider": result["provider"],
         "usage": result["usage"],
+        "cache_hit": result["cache_hit"],
     }
 
 

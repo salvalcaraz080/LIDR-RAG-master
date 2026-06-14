@@ -11,6 +11,7 @@ class EstimationResponse(BaseModel):
     model: str = Field(..., description="LLM model used")
     provider: str = Field(..., description="LLM provider used")
     usage: TokenUsage
+    cache_hit: bool = Field(..., description="Whether the response was served from cache")
 
 class EstimationRequest(BaseModel):
     """Incoming request containing a meeting transcription to estimate."""
