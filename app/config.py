@@ -11,6 +11,13 @@ class Settings(BaseSettings):
     APP_ENV: str = "development"
     LOG_LEVEL: str = "DEBUG"
     REDIS_URL: str = "redis://redis:6379"
+    GUARDRAILS_ENFORCE: bool | None = None  # None = derive from APP_ENV
+
+    @property
+    def guardrails_enforce(self) -> bool:
+        if self.GUARDRAILS_ENFORCE is not None:
+            return self.GUARDRAILS_ENFORCE
+        return self.APP_ENV == "production"
 
 
 @lru_cache

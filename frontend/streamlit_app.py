@@ -1,21 +1,16 @@
-import json
-
 import requests
-import sseclient
 import streamlit as st
 
 from config import get_settings
 
 settings = get_settings()
 
-STREAM_ENDPOINT = f"{settings.BACKEND_URL}/api/v1/estimate/stream"
+ESTIMATE_ENDPOINT = f"{settings.BACKEND_URL}/api/v1/estimate"
 MIN_DESCRIPTION_LENGTH = 20
-REQUEST_TIMEOUT_SECONDS = 120  # streaming generation can be long
+REQUEST_TIMEOUT_SECONDS = 120
 
-# Option values MUST match the backend Enum values exactly (case-sensitive — Linux).
-# The labels are only for display; format_func maps value → readable label.
 PROJECT_TYPES = {
-    "mobile_app": "App móvil",
+    "mobile_app": "App movil",
     "web_saas": "Web / SaaS",
     "internal_tool": "Herramienta interna",
     "data_pipeline": "Pipeline de datos",
@@ -27,18 +22,16 @@ DETAIL_LEVELS = {
 }
 OUTPUT_FORMATS = {
     "phases_table": "Tabla por fases",
-    "line_items": "Lista de partidas",
     "narrative": "Narrativa",
 }
 
 st.title("Estimador de Software")
-st.caption("Describe el proyecto y elige los parámetros para obtener una estimación detallada.")
+st.caption("Describe el proyecto y elige los parametros para obtener una estimacion detallada.")
 
-# --- Product form: typed parameters instead of free chat ---
 with st.form("estimation_form"):
     description = st.text_area(
-        "Descripción del proyecto",
-        placeholder="Describe el proyecto a estimar (mínimo 20 caracteres)...",
+        "Descripcion del proyecto",
+        placeholder="Describe el proyecto a estimar (minimo 20 caracteres)...",
         height=180,
     )
     project_type = st.selectbox(
@@ -56,64 +49,83 @@ with st.form("estimation_form"):
         options=list(OUTPUT_FORMATS.keys()),
         format_func=lambda v: OUTPUT_FORMATS[v],
     )
-    submitted = st.form_submit_button("Generar estimación")
+    submitted = st.form_submit_button("Generar estimacion")
 
 if submitted:
     if len(description) < MIN_DESCRIPTION_LENGTH:
         st.error(
-            f"La descripción es demasiado corta ({len(description)} caracteres). "
-            f"Mínimo {MIN_DESCRIPTION_LENGTH}."
+            f"La descripcion es demasiado corta ({len(description)} caracteres). "
+            f"Minimo {MIN_DESCRIPTION_LENGTH}."
         )
     else:
-        # Captured side-channel: the bridge generator only yields token TEXT
-        # (that's what write_stream paints). Metadata and errors arrive as
-        # separate SSE events, so we stash them here to use after the stream ends.
-        captured = {"metadata": None, "error": None}
-
-        def token_stream():
-            """Bridge: SSE events from the backend → text fragments for write_stream."""
-            response = requests.post(
-                STREAM_ENDPOINT,
-                json={
-                    "description": description,
-                    "project_type": project_type,
-                    "detail_level": detail_level,
-                    "output_format": output_format,
-                },
-                headers={"Accept": "text/event-stream"},
-                stream=True,  # don't buffer the whole response
-                timeout=REQUEST_TIMEOUT_SECONDS,
-            )
-            response.raise_for_status()
-
-            client = sseclient.SSEClient(response)
-            for event in client.events():
-                payload = json.loads(event.data)  # all events are JSON-encoded
-                if event.event == "token":
-                    yield payload  # the text fragment → painted by write_stream
-                elif event.event == "done":
-                    captured["metadata"] = payload
-                elif event.event == "error":
-                    captured["error"] = payload.get("error", "Error desconocido")
-                    return  # stop the generator on backend error
-
-        try:
-            # write_stream paints each yielded fragment live AND returns the
-            # full concatenated text once the generator is exhausted.
-            st.write_stream(token_stream())
-
-            if captured["error"]:
-                # Backend failed mid-generation (arrived as an SSE 'error' event)
-                st.error(f"⚠️ El backend falló durante la generación: {captured['error']}")
-            elif captured["metadata"]:
-                m = captured["metadata"]
-                st.markdown(
-                    f"_{m['provider']} · {m['model']} · {m['usage']['total_tokens']} tokens_"
+        with st.spinner("Generando estimacion..."):
+            try:
+                response = requests.post(
+                    ESTIMATE_ENDPOINT,
+                    json={
+                        "description": description,
+                        "project_type": project_type,
+                        "detail_level": detail_level,
+                        "output_format": output_format,
+                    },
+                    timeout=REQUEST_TIMEOUT_SECONDS,
                 )
+                response.raise_for_status()
+                data = response.json()
+            except requests.exceptions.HTTPError as exc:
+                if exc.response is not None and exc.response.status_code == 400:
+                    st.error(
+                        f"Solicitud rechazada: {exc.response.json().get('detail', str(exc))}"
+                    )
+                else:
+                    st.error(f"Error del backend: {exc}")
+                st.stop()
+            except requests.exceptions.RequestException as exc:
+                st.error(
+                    f"No se pudo conectar con el backend en {settings.BACKEND_URL}. "
+                    f"Esta levantado? ({type(exc).__name__})"
+                )
+                st.stop()
 
-        except requests.exceptions.RequestException as exc:
-            # Backend unreachable, or non-2xx before streaming started (e.g. 422)
-            st.error(
-                f"⚠️ No se pudo conectar con el backend en {settings.BACKEND_URL}. "
-                f"¿Está levantado? ({type(exc).__name__})"
-            )
+        result = data.get("result", {})
+        summary = result.get("summary", "")
+        phases = result.get("phases", [])
+        total_cost = result.get("total_cost_eur", 0)
+        total_weeks = result.get("total_duration_weeks", 0)
+        confidence = result.get("confidence_pct", 0)
+
+        # Out-of-scope / low-confidence degraded case
+        if summary.startswith("Out of scope:") or (confidence == 0 and not phases):
+            st.warning(summary or "El proyecto no pudo ser estimado con la informacion proporcionada.")
+        else:
+            st.subheader("Estimacion")
+            st.write(summary)
+
+            if output_format == "phases_table" and phases:
+                st.subheader("Desglose por fases")
+                table_data = [
+                    {
+                        "Fase": p["name"],
+                        "Duracion (semanas)": p["duration_weeks"],
+                        "Coste (EUR)": p["cost_eur"],
+                        "Confianza (%)": p["confidence_pct"],
+                    }
+                    for p in phases
+                ]
+                st.table(table_data)
+
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Duracion total", f"{total_weeks} semanas")
+            col2.metric("Coste total", f"{total_cost:,} EUR")
+            col3.metric("Confianza", f"{confidence}%")
+
+        # Metadata footer
+        m_model = data.get("model", "")
+        m_provider = data.get("provider", "")
+        m_usage = data.get("usage", {})
+        m_cache = data.get("cache_hit", False)
+        m_version = data.get("prompt_version", "")
+        st.caption(
+            f"_{m_provider} · {m_model} · {m_usage.get('total_tokens', 0)} tokens · "
+            f"prompt {m_version} · {'cache hit' if m_cache else 'cache miss'}_"
+        )

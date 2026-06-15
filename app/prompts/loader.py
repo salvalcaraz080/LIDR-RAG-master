@@ -9,6 +9,8 @@ from pathlib import Path
 
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
+from app.schemas.estimations import OUT_OF_SCOPE_PREFIX
+
 PROMPTS_DIR = Path(__file__).parent
 
 _env = Environment(
@@ -32,6 +34,7 @@ def render_estimation_prompt(
         "project_type": project_type,
         "detail_level": detail_level,
         "output_format": output_format,
+        "out_of_scope_prefix": OUT_OF_SCOPE_PREFIX,
     }
     system = _env.get_template(f"estimation/{version}/system.j2").render(context)
     user = _env.get_template(f"estimation/{version}/user.j2").render(context)

@@ -1,14 +1,19 @@
 import hashlib
 import json
+from typing import TypeVar
 
 import redis.asyncio as aredis
 import structlog
+from pydantic import BaseModel
 
+from app.config import get_settings
 from app.services import llm_wrapper
 
 log = structlog.get_logger()
 
-CACHE_TTL_SECONDS = 86400  # 24h — see design note on TTL
+CACHE_TTL_SECONDS = 86400  # 24h
+
+T = TypeVar("T", bound=BaseModel)
 
 
 def _cache_key(messages: list[dict], model: str, max_tokens: int) -> str:
@@ -16,6 +21,9 @@ def _cache_key(messages: list[dict], model: str, max_tokens: int) -> str:
 
     sort_keys=True → stable serialization regardless of dict key order.
     sha256 → stable across processes (Python's hash() is randomized per run).
+
+    PENDING (B5): include prompt_version in key so a schema/prompt change
+    auto-invalidates existing cache entries.
     """
     raw = json.dumps(
         {"messages": messages, "model": model, "max_tokens": max_tokens},
@@ -25,41 +33,48 @@ def _cache_key(messages: list[dict], model: str, max_tokens: int) -> str:
     return f"llm:{digest}"
 
 
-async def cached_complete(
+async def cached_complete_structured(
     messages: list[dict],
-    model: str,
+    response_model: type[T],
     max_tokens: int,
     redis: aredis.Redis,
-) -> dict:
-    """Exact-match cache layer over the wrapper's non-streaming completion.
+) -> tuple[T, dict, bool]:
+    """Exact-match cache over structured completion. Returns (instance, metadata, cache_hit).
 
-    Cache is an optimization, not the source of truth: any Redis failure
-    degrades gracefully to a direct LLM call (logged, not raised).
+    On hit, deserializes the cached JSON back to response_model.
+    Cache is an optimization: any Redis failure degrades gracefully to a direct call.
     """
+    model = get_settings().LLM_MODEL
     key = _cache_key(messages, model, max_tokens)
 
-    # --- Read: a Redis failure is treated as a miss, never fatal ---
+    # --- Read ---
     try:
-        cached = await redis.get(key)
+        cached_raw = await redis.get(key)
     except Exception as exc:
         log.warning("cache_read_failed", error=str(exc))
-        cached = None
+        cached_raw = None
 
-    if cached is not None:
+    if cached_raw is not None:
         log.info("cache_hit", key=key)
-        result = json.loads(cached)
-        result["cache_hit"] = True
-        return result
+        payload = json.loads(cached_raw)
+        instance = response_model.model_validate(payload["result"])
+        metadata = payload["metadata"]
+        return instance, metadata, True
 
-    # --- Miss: call the LLM through the wrapper ---
+    # --- Miss ---
     log.info("cache_miss", key=key)
-    result = await llm_wrapper.complete(messages, model, max_tokens)
+    instance, metadata = await llm_wrapper.complete_structured(
+        messages, response_model, max_tokens
+    )
 
-    # --- Write: store the clean payload; a failure is non-fatal ---
+    # --- Write ---
+    payload = {
+        "result": instance.model_dump(),
+        "metadata": metadata,
+    }
     try:
-        await redis.set(key, json.dumps(result), ex=CACHE_TTL_SECONDS)
+        await redis.set(key, json.dumps(payload), ex=CACHE_TTL_SECONDS)
     except Exception as exc:
         log.warning("cache_write_failed", error=str(exc))
 
-    result["cache_hit"] = False
-    return result
+    return instance, metadata, False

@@ -15,6 +15,7 @@ debug.py
 venv/
 
 # Testing / linting caches
+scripts/
 .pytest_cache/
 .ruff_cache/
 

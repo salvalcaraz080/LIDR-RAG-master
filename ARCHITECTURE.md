@@ -23,6 +23,7 @@ tanto *qué hace* como *por qué está construido así*.
    - [5.2 `cache` — caché Redis](#52-cache--caché-cache-aside-sobre-redis)
    - [5.3 `llm_wrapper` — adaptador LLM](#53-llm_wrapper--adaptador-llm-agnóstico-de-dominio)
    - [5.4 `prompts` — templates Jinja2](#54-prompts--templates-jinja2-versionados)
+   - [5.5 `guardrails` — validación de input](#55-guardrails--validación-de-input-agnóstica-de-dominio)
 6. [Context — datos CAG](#6-context--datos-de-referencia-cag)
 7. [Infraestructura transversal](#7-infraestructura-transversal)
    - [7.1 Configuración](#71-configuración-appconfigpy)
@@ -57,7 +58,8 @@ flowchart TB
         service["services/llm_service.py<br/>orquestación del dominio"]
         prompts["prompts/loader.py<br/>templates Jinja2 v1"]
         cache["services/cache.py<br/>caché cache-aside"]
-        wrapper["services/llm_wrapper.py<br/>adaptador LLM · litellm Router"]
+        guardrails["services/guardrails.py<br/>validacion input · moderation"]
+        wrapper["services/llm_wrapper.py<br/>Instructor · acompletion · fallback"]
     end
 
     subgraph infra["🔧 Infraestructura transversal"]
@@ -69,15 +71,16 @@ flowchart TB
     providers{{"Proveedores LLM<br/>OpenAI · Anthropic"}}
 
     user -->|"navegador"| ui
-    ui -->|"POST /estimate/stream (SSE)"| router
+    ui -->|"POST /estimate (JSON)"| router
     router -->|"valida con"| schema
     router -->|"delega a"| service
+    service -->|"validate_input"| guardrails
     service -->|"render (system, user)"| prompts
     service -->|"non-stream"| cache
     service -->|"stream"| wrapper
     cache <-->|"get / set"| redis
     cache -->|"miss"| wrapper
-    wrapper -->|"acompletion + fallback"| providers
+    wrapper -->|"Instructor + fallback"| providers
 
     config -.->|"settings"| backend
     logging -.->|"request_id, path"| backend
@@ -93,7 +96,7 @@ flowchart TB
 | **Frontend** | `frontend/streamlit_app.py` | Formulario de producto (descripción + parámetros tipados), consume el stream SSE, pinta tokens en vivo | No habla con el LLM ni conoce su API |
 | **Routers** | `app/routers/estimations.py` | Recibe HTTP, valida, **delega**, traduce errores a códigos HTTP | Sin lógica de negocio |
 | **Schemas** | `app/schemas/estimations.py` | Contrato Pydantic request/response (Enums tipados) — el borde HTTP | No es el núcleo del dominio |
-| **Services** | `app/services/*.py` | Lógica de negocio: orquestación, caché, llamada LLM, post-proceso | No conoce HTTP |
+| **Services** | `app/services/*.py` | Lógica de negocio: guardrails, orquestación, caché, llamada LLM, post-proceso | No conoce HTTP |
 | **Prompts** | `app/prompts/` | Templates Jinja2 versionados + loader; renderiza `(system, user)` | No conoce HTTP ni el LLM |
 | **Context** | `app/context/examples.py` | Datos de referencia (obsoleto en CAG; vuelve en RAG) | No formatea el prompt |
 | **Infra** | `config`, `dependencies`, `logging_config`, `main` | Configuración, DI, logging, ciclo de vida | No es lógica de dominio |
@@ -104,7 +107,8 @@ El flujo de control siempre va **de fuera hacia dentro**, y las dependencias nun
 
 ```
 Frontend → Router → Service → Cache → Wrapper → Proveedor LLM
-                       │
+                       │         │
+                       │         └─→ Guardrails (validate_input)
                        └─→ Prompts (loader + templates Jinja2)
 ```
 
@@ -217,8 +221,9 @@ Cuatro detalles arquitectónicos importantes:
 4. **`EstimationResponse(**result)`** — la validación Pydantic ocurre en el borde, sobre el `dict`
    plano que devuelve el servicio.
 
-El endpoint de stream traduce los eventos tipados del servicio (`token` / `done`) a `ServerSentEvent`,
-y captura `LLMError` para emitir un evento SSE `error` en lugar de romper la conexión.
+El endpoint de stream traduce los eventos tipados del servicio (`partial` / `done` / `error`) a
+`ServerSentEvent`. Traduce excepciones: `InputGuardrailError → HTTP 400`, `LLMError → HTTP 500`.
+En el endpoint stream las excepciones de guardrail/LLM se emiten como evento SSE `error`.
 
 ---
 
@@ -236,150 +241,185 @@ classDiagram
         +OutputFormat output_format
     }
     class EstimationResponse {
-        +str estimation (markdown)
+        +EstimationResult result
         +str model
         +str provider
         +TokenUsage usage
         +bool cache_hit
+        +str prompt_version
+    }
+    class EstimationResult {
+        +str summary
+        +int total_duration_weeks
+        +int total_cost_eur
+        +int confidence_pct
+        +list[Phase] phases
+    }
+    class Phase {
+        +str name
+        +int duration_weeks
+        +int cost_eur
+        +int confidence_pct
+        +list[str] assumptions
     }
     class TokenUsage {
         +int input_tokens
         +int output_tokens
         +int total_tokens
     }
+    EstimationResponse --> EstimationResult
     EstimationResponse --> TokenUsage
+    EstimationResult --> Phase
 ```
 
 - **`EstimationRequest`** — valida la entrada en el borde: `description` (20–2000 caracteres) más tres
   parámetros tipados como Enums (`ProjectType`, `DetailLevel`, `OutputFormat`). Una petición fuera de
   rango o con un valor de Enum inválido produce automáticamente un `422` antes de tocar la lógica de
-  negocio. Estos parámetros, ya validados, son los que alimentan el render del prompt.
-- **`EstimationResponse`** — forma de la salida no-stream, incluido `cache_hit` (transparencia sobre
-  si la respuesta vino de caché) y el desglose de `usage`.
+  negocio.
+- **`EstimationResult`** — output estructurado del LLM. Tiene dos `model_validator`:
+  - `total_must_match_sum_of_phases`: suma de duraciones/costes de fases debe cuadrar con los totales
+    (±1 semana, ±5% coste). Si `total_cost_eur==0`, compara en absoluto para evitar división por cero.
+    Instructor reintenta si falla.
+  - `low_confidence_must_be_explicit`: si `confidence_pct < 30` y `summary` no empieza por
+    `OUT_OF_SCOPE_PREFIX` → error. Instructor reintenta o el modelo acepta que es out-of-scope.
+- **`OUT_OF_SCOPE_PREFIX`** — constante en este módulo. La importan el validador Y el loader (la
+  inyecta en el contexto del template). Un único punto de definición.
+- **`EstimationResponse`** — ahora incluye `result: EstimationResult`, `prompt_version` y conserva
+  `model`, `provider`, `usage`, `cache_hit` de S03.
 
-Los schemas son deliberadamente delgados: son el **contrato del borde**, no estructuras que circulen
-por el dominio. Por eso el servicio devuelve `dict` y es el router quien instancia el schema.
+Los schemas son el **contrato del borde HTTP**. El servicio devuelve `dict` plano; el router instancia el schema.
 
 ---
 
 ## 5. Services — lógica de negocio
 
-El corazón del sistema. Tres módulos con responsabilidades nítidas y dependencias en una sola
+El corazón del sistema. Cuatro módulos con responsabilidades nítidas y dependencias en una sola
 dirección:
 
 ```mermaid
 flowchart LR
     subgraph services["app/services/"]
-        ls["llm_service.py<br/><b>orquesta el dominio</b><br/>render prompt + mapeo a dominio"]
-        ca["cache.py<br/><b>caché cache-aside</b><br/>clave determinista + TTL"]
-        lw["llm_wrapper.py<br/><b>adaptador LLM</b><br/>litellm Router + fallback"]
+        ls["llm_service.py<br/><b>orquesta el dominio</b><br/>guardrails → prompt → cache → mapeo"]
+        gr["guardrails.py<br/><b>validacion input</b><br/>moderation + injection"]
+        ca["cache.py<br/><b>cache-aside estructurado</b><br/>EstimationResult serializado"]
+        lw["llm_wrapper.py<br/><b>adaptador LLM</b><br/>Instructor + fallback"]
     end
     prompts["prompts/loader.py<br/>templates Jinja2 v1"]
 
+    ls -->|"validate_input"| gr
     ls -->|"non-stream"| ca
-    ls -->|"stream (sin caché)"| lw
+    ls -->|"stream (sin cache)"| lw
     ls -.->|"render (system, user)"| prompts
-    ca -->|"miss → completa"| lw
+    ca -->|"miss"| lw
     lw --> prov{{"OpenAI / Anthropic"}}
 ```
 
 Niveles de abstracción (de mayor a menor):
 
-- **`llm_service`** conoce el *dominio* (estimaciones); delega el contenido del prompt al loader.
+- **`llm_service`** conoce el *dominio* (estimaciones); orquesta guardrails, loader y caché.
+- **`guardrails`** conoce las *reglas de validación de input*, pero no el dominio de estimaciones.
 - **`prompts/loader`** conoce el *formato del prompt* (templates Jinja2 versionados), pero ni HTTP ni el LLM.
 - **`cache`** conoce el *patrón de caché* (clave, TTL, degradación), pero no el dominio.
-- **`llm_wrapper`** conoce el *proveedor LLM* (litellm, fallback), pero ni el dominio ni la caché.
+- **`llm_wrapper`** conoce el *proveedor LLM* (Instructor + litellm, fallback), pero ni el dominio ni la caché.
 
 ### 5.1 `llm_service` — orquestación del dominio
 
 [`app/services/llm_service.py`](app/services/llm_service.py). Es la **única capa que conoce el
-dominio "estimación"**. Responsabilidades:
+dominio "estimación"**. Responsabilidades (en orden de ejecución):
 
-1. **Pedir el prompt al loader** (`render_estimation_prompt`): el contenido del prompt (rol, reglas,
-   formato de salida, tarifas, ejemplos) ya **no se construye con f-strings aquí** — vive en los
-   templates Jinja2 versionados de `app/prompts/`. El servicio solo pasa las primitivas tipadas
-   (`description`, `project_type`, `detail_level`, `output_format`) y recibe la tupla `(system, user)`.
-2. **Ensamblar los mensajes** (`_build_messages`): `messages = [system, user]`.
-3. **Mapear el resultado a un `dict` plano del dominio** `{estimation, model, provider, usage,
-   cache_hit}` — sin instanciar schemas Pydantic (mantiene el núcleo agnóstico del borde HTTP).
+1. **`validate_input(description)`** — **SIEMPRE PRIMERO** (invariante de orden). Antes de construir
+   mensajes y antes del cache lookup. Solo se cachean outputs que pasaron validación.
+2. **Pedir el prompt al loader** (`render_estimation_prompt`): devuelve la tupla `(system, user)`.
+3. **Ensamblar los mensajes**: `messages = [system, user]`.
+4. **`cache.cached_complete_structured`**: cache-aside sobre `EstimationResult`. En miss llama al
+   wrapper, que usa Instructor con hasta `max_retries=2`.
+5. **Mapear a `dict` plano** `{result, model, provider, usage, cache_hit, prompt_version}`.
 
-Dos puntos de entrada según el modo:
+Dos puntos de entrada:
 
-| Función | Modo | Camino | Caché |
-|---------|------|--------|-------|
-| `generate_estimation` | one-shot | → `cache.cached_complete` | ✅ |
-| `generate_estimation_stream` | streaming (async generator) | → `llm_wrapper.stream` directo | ❌ |
+| Función | Modo | Caché | Validación post |
+|---------|------|-------|-----------------|
+| `generate_estimation` | one-shot | ✅ Redis | Instructor reintenta en validación |
+| `generate_estimation_stream` | streaming Partial | ❌ (pendiente B5) | Post-hoc al cerrar stream |
 
-`MAX_TOKENS = 4000` es una decisión de dominio: las estimaciones caben holgadamente por debajo de
-ese límite.
+`MAX_TOKENS = 4000` y `PROMPT_VERSION = "v1"` son decisiones de dominio.
 
 ### 5.2 `cache` — caché cache-aside sobre Redis
 
 [`app/services/cache.py`](app/services/cache.py). Capa de **caché exacta (exact-match)** sobre la
-completación no-streaming del wrapper. Implementa el patrón **cache-aside**:
+completación estructurada. Implementa el patrón **cache-aside**:
 
 ```mermaid
 flowchart TD
-    start([cached_complete]) --> key["clave = sha256(messages + model + max_tokens)<br/>prefijo 'llm:'"]
+    start([cached_complete_structured]) --> key["clave = sha256(messages + model + max_tokens)"]
     key --> read{"redis.get(key)"}
-    read -->|"error Redis"| miss_log["log warning<br/>tratar como miss"]
-    read -->|"valor"| hit["✅ cache_hit=True<br/>devolver cacheado"]
-    read -->|"None"| miss["❌ cache_miss"]
+    read -->|"error Redis"| miss_log["log warning / tratar como miss"]
+    read -->|"valor JSON"| hit["deserializar EstimationResult + metadatos<br/>cache_hit=True"]
+    read -->|"None"| miss["cache_miss"]
     miss_log --> miss
-    miss --> llm["llm_wrapper.complete()"]
-    llm --> write{"redis.set(key, ex=24h)"}
-    write -->|"error Redis"| write_log["log warning<br/>no fatal"]
-    write --> ret["cache_hit=False<br/>devolver resultado"]
-    write_log --> ret
+    miss --> llm["llm_wrapper.complete_structured()"]
+    llm --> write{"redis.set(model_dump_json, ex=24h)"}
+    write -->|"error Redis"| write_log["log warning / no fatal"]
+    write --> ret["cache_hit=False"]
 ```
 
-**Decisiones de diseño:**
-
-- **Clave determinista**: `json.dumps(..., sort_keys=True)` garantiza serialización estable
-  independientemente del orden de claves; `sha256` da una clave estable entre procesos (el `hash()`
-  de Python está aleatorizado por arranque). La clave incluye **todo lo que afecta a la respuesta**
-  (mensajes, modelo, max_tokens), de modo que un cambio de prompt invalida la entrada automáticamente.
-- **La caché es una optimización, no la fuente de verdad**: cualquier fallo de Redis (lectura o
-  escritura) se **degrada con gracia** — se loguea como `warning` y se trata como miss o se ignora,
-  nunca se propaga como error. El sistema sigue funcionando con Redis caído, solo más lento.
-- **TTL de 24 h** (`CACHE_TTL_SECONDS = 86400`).
-- **`cache_hit`** se añade al resultado para que el borde lo exponga (transparencia al cliente).
+- **Clave determinista**: sha256(messages + model + max_tokens). Un cambio de prompt invalida la
+  caché automáticamente. PENDIENTE (B5): incluir `prompt_version` explícitamente en la clave.
+- **Serialización de `EstimationResult`**: `model_dump()` al escribir, `model_validate()` al leer.
+- **Degradación con gracia**: fallos de Redis → log warning, tratar como miss. Nunca fatal.
 
 ### 5.3 `llm_wrapper` — adaptador LLM agnóstico de dominio
 
 [`app/services/llm_wrapper.py`](app/services/llm_wrapper.py). Adaptador que habla con los proveedores
-LLM vía **litellm**. **No sabe nada del dominio**: recibe `messages`, devuelve texto + metadatos.
+LLM vía **Instructor + litellm**. **No sabe nada del dominio**: recibe `messages` y una clase Pydantic,
+devuelve la instancia tipada + metadatos.
 
-**Fallback automático de proveedores con litellm `Router`:**
+**Instructor sobre litellm — fallback por kwarg:**
 
 ```mermaid
 flowchart LR
-    call["acompletion(model='primary')"] --> primary["primary<br/>(LLM_MODEL, def. openai/gpt-4o-mini)"]
-    primary -->|"✅ ok"| ret[resultado]
-    primary -->|"❌ falla"| secondary["secondary<br/>anthropic/claude-haiku-4-5"]
-    secondary -->|"✅ ok"| ret
-    secondary -->|"❌ falla"| err["LLMError"]
+    call["complete_structured(messages, T)"] --> instructor["AsyncInstructor<br/>from_litellm(acompletion)"]
+    instructor -->|"model=LLM_MODEL<br/>fallbacks=['anthropic/...']"| primary["primary LLM"]
+    primary -->|"ok"| validated["T validado"]
+    primary -->|"falla"| secondary["anthropic/claude-haiku-4-5"]
+    secondary -->|"ok"| validated
+    validated -->|"validacion Pydantic falla"| retry["retry (max_retries=2)"]
+    retry --> primary
 ```
 
-- **Router como singleton**, construido una vez en tiempo de import. Esto (a) preserva el estado de
-  *cooldown* entre peticiones y (b) **falla rápido al arrancar** si la config es inválida, en lugar de
-  en la primera petición de producción.
-- **`fallbacks=[{"primary": ["secondary"]}]`** — si el modelo primario falla, litellm reintenta
-  automáticamente con el secundario (Anthropic Claude Haiku). El parámetro `model` que reciben
-  `complete`/`stream` se acepta por compatibilidad de interfaz, pero **es el Router quien decide** el
-  proveedor real.
+- **`instructor.from_litellm(acompletion)`** — integración estable. No usa `patch(Router)` (bug
+  conocido de carryover de params entre requests). Trade-off: se pierde cooldown state y fail-fast al
+  arrancar; se preserva fallback por llamada.
+- **Formato de fallback**: `fallbacks=["anthropic/claude-haiku-4-5-20251001"]` (lista de strings).
+  El formato dict del Router (`[{"primary": [...]}]`) NO funciona con `acompletion` directo.
+- **`complete_structured(messages, response_model, max_tokens, max_retries=2)`** → `(T, metadata)`.
+  Instructor reintenta hasta `max_retries` veces cuando la validación Pydantic de `T` falla.
+- **`stream_structured(messages, response_model, max_tokens)`** → async generator de eventos:
+  - `{"type": "partial", "data": T_parcial}` — objeto Partial[T] incremental (validadores inactivos).
+  - `{"type": "done", "metadata": {...}}` — evento final tras cerrar el stream.
 
-**Dos modos, dos formas de salida:**
+`_resolve_provider` deduce el proveedor real del modelo respondido (útil cuando el fallback disparó).
 
-- **`complete`** (one-shot) → `dict` `{content, model, provider, usage}`. Captura cualquier excepción
-  del proveedor y la envuelve en `LLMError` (la excepción de dominio que el router traduce a HTTP 500).
-- **`stream`** (async generator) → emite **eventos tipados**:
-  - `{"type": "token", "data": str}` — fragmento de texto.
-  - `{"type": "done", "metadata": {...}}` — evento final con modelo, proveedor y `usage` (se pide con
-    `stream_options={"include_usage": True}`).
+### 5.5 `guardrails` — validación de input agnóstica de dominio
 
-`_resolve_provider` deduce el proveedor real (`get_llm_provider`) a partir del modelo que efectivamente
-respondió — relevante porque, con fallback, puede no ser el primario.
+[`app/services/guardrails.py`](app/services/guardrails.py). Pipeline de defensa sobre el texto del
+usuario **antes** de que llegue al LLM. Es agnóstico del dominio: recibe texto, no sabe de estimaciones.
+
+**Capas (en orden de ejecución):**
+
+1. **Moderation API** (`litellm.moderation`) — detecta contenido prohibido (odio, violencia, etc.).
+   Fallo de la API es no-fatal: se loguea y se continúa.
+2. **Inyección Markdown** — detecta intentos de inyectar los headers que usa `system.j2` (`## Role`,
+   `## Output Format`, `## Scope`, etc.). Patrón adaptado a delimitadores Markdown (el sistema no usa
+   XML; el patrón `</tag>` del módulo no aplica aquí).
+3. **Social engineering** — frases como "ignore previous instructions", "you are now", "jailbreak".
+
+**Política `GUARDRAILS_ENFORCE`** (en `Settings`, derivado de `APP_ENV`):
+- `True` (production) → `raise InputGuardrailError` al primer disparo.
+- `False` (development) → log-only: loguea con structlog pero no bloquea.
+
+`InputGuardrailError` es la excepción de dominio de guardrails; el router la traduce a HTTP 400.
+PENDIENTE: tracker/métricas sobre los logs de disparos en modo log-only.
 
 ### 5.4 `prompts` — templates Jinja2 versionados
 
