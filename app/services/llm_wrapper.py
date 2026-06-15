@@ -48,6 +48,32 @@ def _resolve_provider(model: str) -> str:
         return "unknown"
 
 
+def _usage_from_chunks(chunks) -> dict:
+    """Extract real token usage from a consumed litellm stream wrapper's chunks.
+
+    With stream_options include_usage, the final chunk carries a Usage object
+    (the same numbers the API bills, including tool-schema overhead).
+    """
+    for chunk in reversed(chunks or []):
+        usage = getattr(chunk, "usage", None)
+        if usage is not None:
+            return {
+                "input_tokens": getattr(usage, "prompt_tokens", 0) or 0,
+                "output_tokens": getattr(usage, "completion_tokens", 0) or 0,
+                "total_tokens": getattr(usage, "total_tokens", 0) or 0,
+            }
+    return {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+
+
+def _model_from_chunks(chunks, default: str) -> str:
+    """Read the actual model from the stream chunks (reflects fallback if it fired)."""
+    for chunk in chunks or []:
+        model = getattr(chunk, "model", None)
+        if model:
+            return model
+    return default
+
+
 def _extract_metadata(raw) -> dict:
     """Extract model/provider/usage from a litellm ModelResponse."""
     actual_model = getattr(raw, "model", "unknown") or "unknown"
@@ -117,37 +143,50 @@ async def stream_structured(
     """Streaming structured completion. Yields typed events:
 
       - {"type": "partial", "data": T_partial}   → incremental Partial[T] object
-      - {"type": "done",    "metadata": dict}     → final event with model/usage
+      - {"type": "done",    "metadata": dict}     → final event with model/provider
 
-    Validators in response_model are INACTIVE during streaming (Partial skips them).
-    The service must perform post-hoc validation after the stream closes.
+    Uses Instructor's create_partial (AsyncGenerator[T]). Validators in response_model
+    are INACTIVE during streaming (Partial skips them); the service performs post-hoc
+    validation after the stream closes.
+
+    Real token usage: we pass stream_options={"include_usage": True} so litellm's final
+    chunk carries a Usage object, captured via a completion:response hook and read from
+    the wrapper's chunks. The hook is registered on a PER-CALL client (not the module
+    singleton) so concurrent requests don't cross-contaminate captured state.
     """
     model = get_settings().LLM_MODEL
     log.info("llm_structured_stream_started", model=model)
 
+    client = instructor.from_litellm(acompletion)
+    captured: dict = {}
+    client.on("completion:response", lambda response: captured.__setitem__("wrapper", response))
+
     try:
-        async with _instructor.chat.completions.stream(
+        stream = client.chat.completions.create_partial(
             model=model,
             messages=messages,
             response_model=response_model,
             max_tokens=max_tokens,
             fallbacks=_FALLBACK_MODELS,
-        ) as stream:
-            async for partial in stream:
-                yield {"type": "partial", "data": partial}
-
-            # After the stream closes, the final completed object and raw response
-            # are available from the context manager.
-            final = await stream.get_final_completion()
-
+            stream_options={"include_usage": True},
+        )
+        async for partial in stream:
+            yield {"type": "partial", "data": partial}
     except Exception as exc:
         log.error("llm_structured_stream_failed", error=str(exc))
         raise LLMError(f"LLM streaming call failed: {exc}") from exc
 
-    metadata = _extract_metadata(final)
+    chunks = getattr(captured.get("wrapper"), "chunks", None)
+    actual_model = _model_from_chunks(chunks, model)
+    metadata = {
+        "model": actual_model,
+        "provider": _resolve_provider(actual_model),
+        "usage": _usage_from_chunks(chunks),
+    }
     log.info(
         "llm_structured_stream_completed",
         model=metadata["model"],
         provider=metadata["provider"],
+        total_tokens=metadata["usage"]["total_tokens"],
     )
     yield {"type": "done", "metadata": metadata}

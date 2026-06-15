@@ -1,9 +1,10 @@
 # Arquitectura del Estimador CAG
 
 > Sistema de estimación de software construido con **arquitectura CAG** (Context-Augmented Generation).
-> API REST en **FastAPI** + frontend conversacional en **Streamlit**, con **Redis** como caché de
-> respuestas LLM y **structlog** para observabilidad. Parte del máster LIDR (RAG & Agentes); el diseño
-> está preparado para evolucionar de CAG → RAG → agentes sin reescribir las capas externas.
+> API REST en **FastAPI** + frontend de producto en **Streamlit**, con **Redis Stack** como caché
+> **semántico** de respuestas LLM (redisvl) y **structlog** para observabilidad. Parte del máster LIDR
+> (RAG & Agentes); el diseño está preparado para evolucionar de CAG → RAG → agentes sin reescribir las
+> capas externas.
 
 Este documento describe la arquitectura end-to-end. La **sección 1** da la visión general (el mapa).
 Las **secciones siguientes** profundizan capa por capa, respetando la misma separación de
@@ -20,10 +21,11 @@ tanto *qué hace* como *por qué está construido así*.
 4. [Schemas — contratos Pydantic](#4-schemas--contratos-pydantic)
 5. [Services — lógica de negocio](#5-services--lógica-de-negocio)
    - [5.1 `llm_service` — orquestación](#51-llm_service--orquestación-del-dominio)
-   - [5.2 `cache` — caché Redis](#52-cache--caché-cache-aside-sobre-redis)
+   - [5.2 `cache` — caché semántico](#52-cache--caché-semántico-sobre-redis-stack)
    - [5.3 `llm_wrapper` — adaptador LLM](#53-llm_wrapper--adaptador-llm-agnóstico-de-dominio)
    - [5.4 `prompts` — templates Jinja2](#54-prompts--templates-jinja2-versionados)
    - [5.5 `guardrails` — validación de input](#55-guardrails--validación-de-input-agnóstica-de-dominio)
+   - [5.6 `embeddings` — vectores (semilla RAG)](#56-embeddings--vectores-semilla-del-rag)
 6. [Context — datos CAG](#6-context--datos-de-referencia-cag)
 7. [Infraestructura transversal](#7-infraestructura-transversal)
    - [7.1 Configuración](#71-configuración-appconfigpy)
@@ -57,13 +59,14 @@ flowchart TB
         schema["schemas/estimations.py<br/>contratos Pydantic · Enums"]
         service["services/llm_service.py<br/>orquestación del dominio"]
         prompts["prompts/loader.py<br/>templates Jinja2 v1"]
-        cache["services/cache.py<br/>caché cache-aside"]
+        embeddings["services/embeddings.py<br/>litellm.aembedding"]
+        cache["services/cache.py<br/>caché semántico · redisvl"]
         guardrails["services/guardrails.py<br/>validacion input · moderation"]
         wrapper["services/llm_wrapper.py<br/>Instructor · acompletion · fallback"]
     end
 
     subgraph infra["🔧 Infraestructura transversal"]
-        redis[("Redis :6379<br/>caché 24h")]
+        redis[("Redis Stack :6379<br/>vector search · caché 24h")]
         logging["structlog<br/>logging estructurado"]
         config["config.py · Settings"]
     end
@@ -71,15 +74,15 @@ flowchart TB
     providers{{"Proveedores LLM<br/>OpenAI · Anthropic"}}
 
     user -->|"navegador"| ui
-    ui -->|"POST /estimate (JSON)"| router
+    ui -->|"POST /estimate/stream (SSE)"| router
     router -->|"valida con"| schema
     router -->|"delega a"| service
     service -->|"validate_input"| guardrails
+    service -->|"embed_text (1 vez)"| embeddings
     service -->|"render (system, user)"| prompts
-    service -->|"non-stream"| cache
-    service -->|"stream"| wrapper
-    cache <-->|"get / set"| redis
-    cache -->|"miss"| wrapper
+    service -->|"lookup / write"| cache
+    service -->|"miss"| wrapper
+    cache <-->|"acheck / astore (vector + bucket)"| redis
     wrapper -->|"Instructor + fallback"| providers
 
     config -.->|"settings"| backend
@@ -93,10 +96,10 @@ flowchart TB
 
 | Capa | Archivo(s) | Responsabilidad | Lo que **NO** hace |
 |------|-----------|-----------------|--------------------|
-| **Frontend** | `frontend/streamlit_app.py` | Formulario de producto (descripción + parámetros tipados), consume el stream SSE, pinta tokens en vivo | No habla con el LLM ni conoce su API |
+| **Frontend** | `frontend/streamlit_app.py` | Formulario de producto (descripción + parámetros tipados), consume el stream SSE (Partials estructurados), pinta el resultado | No habla con el LLM ni conoce su API |
 | **Routers** | `app/routers/estimations.py` | Recibe HTTP, valida, **delega**, traduce errores a códigos HTTP | Sin lógica de negocio |
 | **Schemas** | `app/schemas/estimations.py` | Contrato Pydantic request/response (Enums tipados) — el borde HTTP | No es el núcleo del dominio |
-| **Services** | `app/services/*.py` | Lógica de negocio: guardrails, orquestación, caché, llamada LLM, post-proceso | No conoce HTTP |
+| **Services** | `app/services/*.py` | Lógica de negocio: guardrails, embeddings, orquestación, caché semántico, llamada LLM | No conoce HTTP |
 | **Prompts** | `app/prompts/` | Templates Jinja2 versionados + loader; renderiza `(system, user)` | No conoce HTTP ni el LLM |
 | **Context** | `app/context/examples.py` | Datos de referencia (obsoleto en CAG; vuelve en RAG) | No formatea el prompt |
 | **Infra** | `config`, `dependencies`, `logging_config`, `main` | Configuración, DI, logging, ciclo de vida | No es lógica de dominio |
@@ -106,9 +109,10 @@ flowchart TB
 El flujo de control siempre va **de fuera hacia dentro**, y las dependencias nunca se invierten:
 
 ```
-Frontend → Router → Service → Cache → Wrapper → Proveedor LLM
-                       │         │
-                       │         └─→ Guardrails (validate_input)
+Frontend → Router → Service → Cache semántico (hit) → Proveedor LLM (miss)
+                       │          │
+                       │          ├─→ Guardrails (validate_input, PRIMERO)
+                       │          └─→ Embeddings (embed_text, 1 vez)
                        └─→ Prompts (loader + templates Jinja2)
 ```
 
@@ -132,42 +136,48 @@ Es un **servicio separado** del backend: su propio contenedor, su propio grupo d
   `output_format`). Los labels son legibles, pero el valor enviado es **exactamente** el value del Enum
   del backend (case-sensitive — el backend corre en Linux).
 - Validar longitud mínima de la descripción (20 caracteres) **antes** de llamar al backend.
-- Consumir el endpoint de **streaming** vía SSE y pintar los tokens en vivo con `st.write_stream`.
+- Consumir **SIEMPRE** el endpoint de **streaming** vía SSE (el no-stream se reserva para consumidores
+  programáticos) y renderizar el resultado estructurado al cerrar el stream.
 
-### Patrón clave: puente SSE → `write_stream`
+### Patrón clave: puente SSE con Partials estructurados
 
-`st.write_stream` solo sabe pintar fragmentos de texto, pero el backend emite **tres tipos de evento
-SSE** (`token`, `done`, `error`). El frontend resuelve esto con un *generador puente* y un
-*side-channel* capturado por clausura:
+A diferencia de S03 (que streameaba tokens de prosa), el backend ahora emite **Partial[EstimationResult]
+estructurado**. El frontend tiene un generador puente (`stream_estimation`) que parsea los eventos SSE
+con `sseclient-py` y entrega tuplas `(event_type, data)`:
 
 ```mermaid
 sequenceDiagram
     participant U as Usuario
     participant S as Streamlit
-    participant G as token_stream()<br/>(generador puente)
+    participant G as stream_estimation()<br/>(puente SSE)
     participant B as Backend /estimate/stream
 
     U->>S: rellena formulario (description + params)
     S->>S: valida longitud ≥ 20
-    S->>G: st.write_stream(token_stream())
-    G->>B: POST {description, project_type, detail_level, output_format}<br/>(stream=True, Accept: text/event-stream)
+    S->>G: for event_type, data in stream_estimation(payload)
+    G->>B: POST {...} (stream=True, Accept: text/event-stream)
     loop por cada evento SSE
-        B-->>G: event: token / done / error
-        alt token
-            G-->>S: yield texto  → pintado en vivo
+        B-->>G: event: partial / done / error
+        alt partial
+            G-->>S: dict parcial → indicador de progreso (nº fases)
         else done
-            G->>G: captured["metadata"] = payload
+            G-->>S: {result, metadata{cache_hit}} → render final
         else error
-            G->>G: captured["error"] = payload
+            G-->>S: {error} → st.error
         end
     end
-    S->>S: añade metadata (provider · model · tokens)
-    S->>U: respuesta completa + línea de metadatos
+    S->>U: tabla/narrativa + línea de metadatos (cache hit/miss)
 ```
 
-Los eventos `done` (metadatos) y `error` no se pintan como texto: se guardan en el dict `captured` y
-se procesan **después** de que el generador se agote, cuando `write_stream` ya ha devuelto el texto
-completo concatenado.
+El frontend **no hace render progresivo** (redibujar la tabla en cada Partial parpadea en Streamlit):
+muestra un contador de fases recibidas mientras llega el stream y pinta el resultado completo al recibir
+`done`. Un HIT de caché emite `done` directamente; un MISS valida post-hoc al cerrar y, si falla, emite
+`error`.
+
+> **PROVISIONAL** (pendiente sesión en vivo): cómo presentar un fallo de validación a mitad de stream.
+> El streaming (`create_partial`) **no reintenta** como el no-stream; por eso el prompt prohíbe
+> explícitamente salidas inválidas (p. ej. fases de 0 semanas) que el path no-stream sí salvaría con los
+> retries de Instructor.
 
 ### Manejo de errores
 
@@ -191,20 +201,22 @@ traduce el resultado/errores a HTTP. **No contiene lógica de negocio.**
 
 | Método | Ruta | Respuesta | Caché | Uso |
 |--------|------|-----------|-------|-----|
-| `POST` | `/api/v1/estimate` | `EstimationResponse` (JSON) | ✅ Redis | Consumidores programáticos |
-| `POST` | `/api/v1/estimate/stream` | SSE (`EventSourceResponse`) | ❌ (pendiente) | UIs conversacionales |
+| `POST` | `/api/v1/estimate` | `EstimationResponse` (JSON) | ✅ semántico | Consumidores programáticos |
+| `POST` | `/api/v1/estimate/stream` | SSE (`EventSourceResponse`) | ✅ semántico | UI (la consume SIEMPRE) |
 | `GET`  | `/health` | `{"status": "healthy"}` | — | Health check (Docker/orquestador) |
 
 ### Patrón de delegación
 
 ```python
 @router.post("/estimate", response_model=EstimationResponse)
-async def create_estimation(request: EstimationRequest, redis = Depends(get_redis)):
+async def create_estimation(request: EstimationRequest, semantic_cache = Depends(get_semantic_cache)):
     try:
         result = await generate_estimation(                              # desempaqueta el schema
             request.description, request.project_type.value,
-            request.detail_level.value, request.output_format.value, redis,
+            request.detail_level.value, request.output_format.value, semantic_cache,
         )
+    except InputGuardrailError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))             # input rechazado
     except LLMError as exc:
         raise HTTPException(status_code=500, detail=str(exc))             # traduce error
     return EstimationResponse(**result)                                   # valida en el borde
@@ -215,8 +227,9 @@ Cuatro detalles arquitectónicos importantes:
 1. **El router es el único que toca el schema** — desempaqueta `EstimationRequest` en primitivas
    (`.value` de cada Enum) antes de delegar. El servicio y la capa de prompts reciben primitivas, no
    el contrato HTTP.
-2. **Inyección de Redis vía `Depends(get_redis)`** — el router no construye el cliente, lo recibe.
-3. **`LLMError → HTTPException(500)`** — la excepción de dominio del wrapper se traduce a HTTP
+2. **Inyección del cache semántico vía `Depends(get_semantic_cache)`** — el router no construye el
+   `SemanticCache` (se crea una vez en `lifespan`), lo recibe.
+3. **`InputGuardrailError → 400`, `LLMError → 500`** — las excepciones de dominio se traducen a HTTP
    *solo aquí*. El servicio nunca conoce códigos HTTP.
 4. **`EstimationResponse(**result)`** — la validación Pydantic ocurre en el borde, sobre el `dict`
    plano que devuelve el servicio.
@@ -277,9 +290,10 @@ classDiagram
   rango o con un valor de Enum inválido produce automáticamente un `422` antes de tocar la lógica de
   negocio.
 - **`EstimationResult`** — output estructurado del LLM. Tiene dos `model_validator`:
-  - `total_must_match_sum_of_phases`: suma de duraciones/costes de fases debe cuadrar con los totales
-    (±1 semana, ±5% coste). Si `total_cost_eur==0`, compara en absoluto para evitar división por cero.
-    Instructor reintenta si falla.
+  - `total_must_match_sum_of_phases`: **computa** `total_duration_weeks` y `total_cost_eur` como suma
+    exacta de las fases (los sobreescribe, no los valida con tolerancia). La aritmética es nuestra
+    responsabilidad, no del LLM — así eliminamos retries por totales que no cuadran. Si no hay fases
+    (caso out-of-scope), conserva los totales recibidos (0).
   - `low_confidence_must_be_explicit`: si `confidence_pct < 30` y `summary` no empieza por
     `OUT_OF_SCOPE_PREFIX` → error. Instructor reintenta o el modelo acepta que es out-of-scope.
 - **`OUT_OF_SCOPE_PREFIX`** — constante en este módulo. La importan el validador Y el loader (la
@@ -293,33 +307,34 @@ Los schemas son el **contrato del borde HTTP**. El servicio devuelve `dict` plan
 
 ## 5. Services — lógica de negocio
 
-El corazón del sistema. Cuatro módulos con responsabilidades nítidas y dependencias en una sola
-dirección:
+El corazón del sistema. Módulos con responsabilidades nítidas y dependencias en una sola dirección:
 
 ```mermaid
 flowchart LR
     subgraph services["app/services/"]
-        ls["llm_service.py<br/><b>orquesta el dominio</b><br/>guardrails → prompt → cache → mapeo"]
+        ls["llm_service.py<br/><b>orquesta el dominio</b><br/>guardrails → embed → cache → wrapper"]
         gr["guardrails.py<br/><b>validacion input</b><br/>moderation + injection"]
-        ca["cache.py<br/><b>cache-aside estructurado</b><br/>EstimationResult serializado"]
+        em["embeddings.py<br/><b>embed_text</b><br/>litellm.aembedding"]
+        ca["cache.py<br/><b>cache semántico</b><br/>redisvl · vector + bucket"]
         lw["llm_wrapper.py<br/><b>adaptador LLM</b><br/>Instructor + fallback"]
     end
     prompts["prompts/loader.py<br/>templates Jinja2 v1"]
 
     ls -->|"validate_input"| gr
-    ls -->|"non-stream"| ca
-    ls -->|"stream (sin cache)"| lw
+    ls -->|"embed_text (1 vez)"| em
+    ls -->|"lookup / write"| ca
+    ls -->|"miss"| lw
     ls -.->|"render (system, user)"| prompts
-    ca -->|"miss"| lw
     lw --> prov{{"OpenAI / Anthropic"}}
 ```
 
 Niveles de abstracción (de mayor a menor):
 
-- **`llm_service`** conoce el *dominio* (estimaciones); orquesta guardrails, loader y caché.
+- **`llm_service`** conoce el *dominio* (estimaciones); orquesta guardrails, embeddings, loader, caché y wrapper.
 - **`guardrails`** conoce las *reglas de validación de input*, pero no el dominio de estimaciones.
+- **`embeddings`** conoce el *modelo de embedding* (litellm), pero no el dominio. Semilla del RAG.
 - **`prompts/loader`** conoce el *formato del prompt* (templates Jinja2 versionados), pero ni HTTP ni el LLM.
-- **`cache`** conoce el *patrón de caché* (clave, TTL, degradación), pero no el dominio.
+- **`cache`** conoce el *patrón de caché semántico* (vector + bucket, threshold, TTL, degradación), pero no el dominio (opera sobre strings opacos).
 - **`llm_wrapper`** conoce el *proveedor LLM* (Instructor + litellm, fallback), pero ni el dominio ni la caché.
 
 ### 5.1 `llm_service` — orquestación del dominio
@@ -327,46 +342,59 @@ Niveles de abstracción (de mayor a menor):
 [`app/services/llm_service.py`](app/services/llm_service.py). Es la **única capa que conoce el
 dominio "estimación"**. Responsabilidades (en orden de ejecución):
 
-1. **`validate_input(description)`** — **SIEMPRE PRIMERO** (invariante de orden). Antes de construir
-   mensajes y antes del cache lookup. Solo se cachean outputs que pasaron validación.
-2. **Pedir el prompt al loader** (`render_estimation_prompt`): devuelve la tupla `(system, user)`.
-3. **Ensamblar los mensajes**: `messages = [system, user]`.
-4. **`cache.cached_complete_structured`**: cache-aside sobre `EstimationResult`. En miss llama al
-   wrapper, que usa Instructor con hasta `max_retries=2`.
-5. **Mapear a `dict` plano** `{result, model, provider, usage, cache_hit, prompt_version}`.
+1. **`validate_input(description)`** — **SIEMPRE PRIMERO** (invariante de orden). Antes de embedding,
+   lookup y LLM. Solo se cachean outputs que pasaron validación.
+2. **`embed_text(description)`** — **una sola vez** por request; el vector se reutiliza para lookup y write.
+3. **`build_bucket_key(prompt_version, project_type, detail_level, output_format)`** — partición determinista.
+4. **`cache.semantic_lookup(vector, bucket, enforce)`**: HIT (en modo enforce) → devuelve el payload
+   cacheado; MISS o log-only → `None`.
+5. **En miss**: pide el prompt al loader, ensambla `messages`, llama a `complete_structured` (Instructor,
+   `max_retries=2`), y `cache.semantic_write` **solo tras validación OK**.
+6. **Mapear a `dict` plano** `{result, model, provider, usage, cache_hit, prompt_version}`.
 
-Dos puntos de entrada:
+Dos puntos de entrada, **ambos cacheados**:
 
 | Función | Modo | Caché | Validación post |
 |---------|------|-------|-----------------|
-| `generate_estimation` | one-shot | ✅ Redis | Instructor reintenta en validación |
-| `generate_estimation_stream` | streaming Partial | ❌ (pendiente B5) | Post-hoc al cerrar stream |
+| `generate_estimation` | one-shot | ✅ semántico | Instructor reintenta en validación |
+| `generate_estimation_stream` | streaming Partial | ✅ semántico | Post-hoc al cerrar stream (PROVISIONAL) |
 
 `MAX_TOKENS = 4000` y `PROMPT_VERSION = "v1"` son decisiones de dominio.
 
-### 5.2 `cache` — caché cache-aside sobre Redis
+### 5.2 `cache` — caché semántico sobre Redis Stack
 
-[`app/services/cache.py`](app/services/cache.py). Capa de **caché exacta (exact-match)** sobre la
-completación estructurada. Implementa el patrón **cache-aside**:
+[`app/services/cache.py`](app/services/cache.py). **Reescrito en B5**: elimina el exact-match sha256 de
+S03. Razón: los inputs humanos/contextuales casi nunca son byte-idénticos, así que un exact-match casi
+nunca acierta; la similaridad semántica subsume el caso exacto (distancia 0 == input idéntico). Es
+**agnóstico de dominio**: opera sobre strings opacos (el servicio (de)serializa `EstimationResult`+metadata).
 
 ```mermaid
 flowchart TD
-    start([cached_complete_structured]) --> key["clave = sha256(messages + model + max_tokens)"]
-    key --> read{"redis.get(key)"}
-    read -->|"error Redis"| miss_log["log warning / tratar como miss"]
-    read -->|"valor JSON"| hit["deserializar EstimationResult + metadatos<br/>cache_hit=True"]
-    read -->|"None"| miss["cache_miss"]
+    start([semantic_lookup]) --> embed["vector = embed_text(description)  (en el servicio, 1 vez)"]
+    embed --> check{"acheck(vector, filter=bucket,<br/>distance_threshold)"}
+    check -->|"error Redis"| miss_log["log warning / miss"]
+    check -->|"0 hits"| miss["cache_miss"]
+    check -->|"hit + enforce"| hit["devuelve response string<br/>cache_hit=True"]
+    check -->|"hit + log-only"| shadow["log vecino + distancia<br/>devuelve None (no bypassa)"]
     miss_log --> miss
+    shadow --> miss
     miss --> llm["llm_wrapper.complete_structured()"]
-    llm --> write{"redis.set(model_dump_json, ex=24h)"}
-    write -->|"error Redis"| write_log["log warning / no fatal"]
-    write --> ret["cache_hit=False"]
+    llm --> write["semantic_write(astore: vector + filters{bucket})"]
 ```
 
-- **Clave determinista**: sha256(messages + model + max_tokens). Un cambio de prompt invalida la
-  caché automáticamente. PENDIENTE (B5): incluir `prompt_version` explícitamente en la clave.
-- **Serialización de `EstimationResult`**: `model_dump()` al escribir, `model_validate()` al leer.
+- **Clave compuesta**: bucket (TAG filtrable determinista `prompt_version:project_type:detail_level:output_format`,
+  partición exacta) + vector (embedding de la descripción, similaridad dentro del bucket). El bucket
+  resuelve el pendiente de S03 de incluir `prompt_version` en la clave: un bump de prompt/schema cae en
+  un bucket nuevo y los viejos expiran por TTL.
+- **Vector propio**: lo computa `embeddings.embed_text` y se pasa a acheck/astore con `vector=`. redisvl
+  nunca carga su vectorizer HF/torch — un `CustomVectorizer` dummy (vector cero) solo fija las dims (1536)
+  del schema al construir.
+- **`distance_threshold = 0.15`** (≈0.85 similaridad), laxo a propósito para experimentar.
+- **Modo log-only** (`SEMANTIC_CACHE_ENFORCE=False`, default en development): hace el lookup y loguea
+  vecino+distancia, pero devuelve `None` (no bypassa el LLM). Observar antes de confiar.
 - **Degradación con gracia**: fallos de Redis → log warning, tratar como miss. Nunca fatal.
+- Abre su propio cliente vía `redis_url` (los bytes binarios del vector son incompatibles con
+  `decode_responses=True` del cliente de la app).
 
 ### 5.3 `llm_wrapper` — adaptador LLM agnóstico de dominio
 
@@ -442,14 +470,27 @@ flowchart LR
   render en lugar de producir un prompt con huecos silenciosos.
 - **Delimitadores Markdown** (`## Section`), no XML: el sistema es **LLM-agnóstico** vía LiteLLM (sin
   "proveedor principal"), y Markdown es el formato neutro mejor entendido por todos los proveedores.
-- **`system.j2`** define rol, reglas y tarifas; ramifica según `output_format` (los tres valores:
-  `phases_table`, `line_items`, `narrative`) y añade un bloque extra (assumptions + intervalo de
-  confianza) solo cuando `detail_level == "detailed"`. Termina con `{% include "…/examples.j2" %}`.
+- **`system.j2`** define rol, reglas, scope (out-of-scope con `{{ out_of_scope_prefix }}`) y tarifas;
+  ramifica según `output_format` (`phases_table`, `narrative`) y añade un bloque extra (assumptions +
+  confianza por fase) solo cuando `detail_level == "detailed"`. Termina con `{% include "…/examples.j2" %}`.
 - **`examples.j2`** contiene los ejemplos few-shot **literales en Markdown** (migrados desde
   `context/examples.py`). En la fase CAG esta es la fuente de los ejemplos; en RAG vendrán de la BD
   vectorial.
 - **Versionado por carpeta** (`v1/`): convivir varias versiones del prompt es cuestión de añadir `v2/`
   y pasar `version="v2"`.
+
+### 5.6 `embeddings` — vectores (semilla del RAG)
+
+[`app/services/embeddings.py`](app/services/embeddings.py). Módulo **agnóstico de dominio** y
+**reutilizable**: `embed_text(text) -> list[float]` vía `litellm.aembedding` con
+`openai/text-embedding-3-small` (1536 dims). El acoplamiento a OpenAI (el modelo de embedding) queda
+contenido aquí.
+
+- En esta fase construye **solo** lo que el cache semántico necesita (embeber un string). No hay
+  retrieval/RAG todavía.
+- Es la **semilla del módulo RAG** (sesiones 7-8): cuando llegue, este mismo módulo embeberá tanto los
+  documentos a indexar como las queries de recuperación.
+- El servicio computa el embedding **una vez** por request y lo reutiliza para lookup y write del cache.
 
 ---
 
@@ -490,19 +531,19 @@ inicializan en [`app/main.py`](app/main.py), que es el punto de entrada y compos
 flowchart TB
     subgraph main["app/main.py — composition root"]
         cfg["configure_logging()"]
-        lifespan["lifespan(app)<br/>abre/cierra Redis"]
+        lifespan["lifespan(app)<br/>construye SemanticCache (crea índice)"]
         mw["middleware bind_request_context<br/>request_id + path por request"]
         routers["include_router(estimations)"]
     end
 
     settings["config.py<br/>Settings (@lru_cache)"]
-    deps["dependencies.py<br/>get_redis"]
+    deps["dependencies.py<br/>get_semantic_cache"]
     logcfg["logging_config.py<br/>structlog"]
 
     settings -.-> cfg
     settings -.-> lifespan
     logcfg -.-> cfg
-    lifespan -->|"app.state.redis"| deps
+    lifespan -->|"app.state.semantic_cache"| deps
     mw -.->|"contextvars"| logcfg
 ```
 
@@ -516,9 +557,13 @@ proceso). Lee de `.env`. Variables:
 | `OPENAI_API_KEY` | *(requerida)* | Credencial OpenAI |
 | `ANTHROPIC_API_KEY` | *(requerida)* | Credencial Anthropic (fallback) |
 | `LLM_MODEL` | `openai/gpt-4o-mini` | Modelo primario |
+| `EMBEDDING_MODEL` | `openai/text-embedding-3-small` | Modelo de embedding (1536 dims) |
 | `APP_ENV` | `development` | Dev → logs consola; `production` → JSON |
 | `LOG_LEVEL` | `DEBUG` | Nivel de log |
-| `REDIS_URL` | `redis://redis:6379` | Endpoint Redis |
+| `REDIS_URL` | `redis://redis:6379` | Endpoint Redis Stack |
+| `GUARDRAILS_ENFORCE` | `None` → APP_ENV | `True`=raise, `False`=log-only |
+| `SEMANTIC_CACHE_ENFORCE` | `None` → APP_ENV | `True`=sirve hits, `False`=log-only |
+| `SEMANTIC_CACHE_DISTANCE_THRESHOLD` | `0.15` | Distancia COSINE máxima para hit (≈0.85 sim) |
 
 > **Seguridad:** las API keys viven en `.env` (ignorado por git y docker). **Nunca** se hornean en la
 > imagen; se inyectan en runtime (`env_file` en Compose). No se reproducen en código, logs ni
@@ -526,19 +571,20 @@ proceso). Lee de `.env`. Variables:
 
 ### 7.2 Inyección de dependencias ([`app/dependencies.py`](app/dependencies.py))
 
-`get_redis(request)` extrae el cliente Redis de `app.state` y lo entrega a los endpoints vía
-`Depends(get_redis)`. Patrón estándar de FastAPI: **un único cliente compartido** por toda la app,
-inyectado donde haga falta, fácil de mockear en tests.
+`get_semantic_cache(request)` extrae el `SemanticCache` de `app.state` y lo entrega a los endpoints vía
+`Depends(get_semantic_cache)`. Patrón estándar de FastAPI: **una única instancia compartida** por toda
+la app (el índice se crea una sola vez), inyectada donde haga falta, fácil de mockear en tests.
 
 ### 7.3 Ciclo de vida (lifespan)
 
 El `@asynccontextmanager lifespan` en `main.py` gestiona recursos con vida igual a la de la app:
 
-- **Startup**: abre el cliente `redis.asyncio` desde `REDIS_URL` (conexión lazy — real en el
-  primer comando) y lo guarda en `app.state.redis`.
-- **Shutdown**: cierra limpiamente el pool de conexiones (`aclose()`).
+- **Startup**: construye el `SemanticCache` (`make_semantic_cache`) desde `REDIS_URL` y el
+  `distance_threshold`. El constructor conecta a Redis Stack y **crea el índice vectorial**. Se guarda
+  en `app.state.semantic_cache`.
+- **Shutdown**: nada que cerrar explícitamente — redisvl gestiona su propio pool.
 
-Esto garantiza un único pool de conexiones por proceso, creado/cerrado en el momento adecuado.
+Esto garantiza un único índice/instancia por proceso, creado en el momento adecuado.
 
 ### 7.4 Logging estructurado (structlog)
 
@@ -563,13 +609,14 @@ flowchart LR
     render -->|"production"| jsonr["JSONRenderer<br/>(agregable)"]
 ```
 
-### 7.5 Caché Redis (infraestructura)
+### 7.5 Caché Redis Stack (infraestructura)
 
-Redis es un **servicio de infraestructura** (no parte del backend). Su rol arquitectónico:
+Redis Stack es un **servicio de infraestructura** (no parte del backend). Su rol arquitectónico:
 
-- **Caché de respuestas LLM** con TTL de 24 h — reduce coste y latencia ante transcripciones
-  repetidas.
-- Cliente gestionado por `lifespan`, inyectado vía `Depends(get_redis)`.
+- **Caché semántico de respuestas LLM** con TTL de 24 h — reduce coste y latencia ante descripciones
+  *semánticamente similares* (no solo idénticas). Necesita el motor de búsqueda vectorial de Redis
+  Stack (`redis/redis-stack`), no el `redis:alpine` de S03.
+- `SemanticCache` construido una vez en `lifespan`, inyectado vía `Depends(get_semantic_cache)`.
 - **Degradación con gracia**: la lógica de `cache.py` trata cualquier fallo de Redis como no fatal, de
   modo que la disponibilidad del sistema no depende de la de Redis.
 - En Compose, el backend **espera a que Redis esté `healthy`** (`depends_on` + `healthcheck`) antes de
@@ -585,7 +632,7 @@ dependencias de arranque ordenadas por health checks.
 ```mermaid
 flowchart TB
     subgraph compose["docker compose"]
-        redis[("redis :6379<br/>redis:7-alpine<br/>healthcheck: redis-cli ping")]
+        redis[("redis :6379 · :8001<br/>redis/redis-stack<br/>healthcheck: redis-cli ping")]
         estimator["estimator :8000<br/>FastAPI + Uvicorn<br/>healthcheck: GET /health"]
         frontend["frontend :8501<br/>Streamlit"]
     end
@@ -634,7 +681,10 @@ mismo patrón **multi-stage** con buenas prácticas:
 | **Servicio devuelve `dict`, no schemas** | Mantiene el núcleo de negocio agnóstico del borde HTTP; la validación vive solo en el router. |
 | **`llm_wrapper` agnóstico de dominio** | Permite cambiar de proveedor o reutilizar el adaptador sin tocar el negocio. |
 | **Caché degradable (no fuente de verdad)** | La disponibilidad del sistema no depende de Redis. |
-| **Fallback de proveedores vía litellm Router** | Resiliencia: si OpenAI cae, responde Anthropic, de forma transparente. |
+| **Caché semántico (no exact-match)** | Los inputs humanos casi nunca son byte-idénticos; la similaridad acierta donde el sha256 fallaba. El bucket aísla por prompt_version + params. |
+| **Vector propio (no vectorizer HF de redisvl)** | Evita meter torch/sentence-transformers; el embedding viaja por litellm, reutilizable para el RAG. |
+| **Caché en modo log-only primero** | Observar hit-rate y calibrar el threshold con datos reales antes de servir hits. |
+| **Fallback de proveedores vía litellm `fallbacks=`** | Resiliencia: si OpenAI cae, responde Anthropic, de forma transparente. |
 | **Prompt en templates Jinja2 versionados, no en f-strings** | Versionar e iterar el prompt sin tocar el código de negocio; loader desacoplado del borde HTTP. |
 | **Parámetros tipados (Enums) en vez de texto libre** | Entrada de producto validada en el borde; cada combinación produce un prompt distinto (y por tanto clave de caché distinta). |
 | **structlog + request_id** | Trazabilidad de extremo a extremo de cada petición. |
@@ -646,17 +696,23 @@ El proyecto está en fase **CAG**: los ejemplos few-shot están precargados est�
 
 - **→ RAG**: los ejemplos literales del template se sustituyen por recuperación desde una BD vectorial
   por similitud, renderizados a través del mismo loader. `context/` se reactiva como fuente de datos.
+  El módulo `embeddings.py` (hoy semilla, usado solo por el cache) será la base de la recuperación.
 - **→ Agentes**: módulos posteriores del máster.
 
 ### Pendientes conocidos
 
-- **Caché del endpoint de streaming** (`/estimate/stream`): hoy no usa Redis. Se abordará junto con la
-  extracción de datos estructurados desde el LLM, que hará las respuestas deterministas y simplificará
-  el cacheo del stream.
+- **Validación-en-stream**: la mecánica exacta (validar Partials a mitad de stream vs post-hoc al
+  cerrar) es PROVISIONAL, pendiente de la sesión en vivo. Implementado el mínimo: acumular + validar al final.
+- **Tracker de hit-rate del cache semántico**: en modo log-only se loguea (input, vecino top-1,
+  distancia); falta un agregador para **calibrar el `distance_threshold`** con datos reales.
+- **Tracker/métricas de guardrails**: los disparos se loguean; falta un dashboard/agregador.
 
 ### Restricciones vigentes
 
-- No introducir RAG, embeddings, BD vectorial ni persistencia todavía (fase CAG).
+- Embeddings permitidos SOLO para el cache semántico (`embeddings.py`). NO introducir RAG/retrieval, BD
+  vectorial como feature, ni persistencia de dominio todavía (fase CAG).
+- No usar el vectorizer HF local de redisvl (mete torch). Vector vía `litellm.aembedding`, pasado con `vector=`.
+- No usar `instructor.patch(Router(...))` — bug conocido de carryover de params.
 - No reproducir credenciales ni valores del `.env` en código, logs ni respuestas.
 - Toda dependencia se gestiona vía `uv add` (reflejada en `pyproject.toml` + `uv.lock`).
 ```

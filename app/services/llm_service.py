@@ -1,10 +1,13 @@
-import redis.asyncio as aredis
-import structlog
+import json
 
+import structlog
+from redisvl.extensions.cache.llm import SemanticCache
+
+from app.config import get_settings
 from app.prompts.loader import render_estimation_prompt
 from app.schemas.estimations import EstimationResult
-from app.services import cache
-from app.services import llm_wrapper
+from app.services import cache, llm_wrapper
+from app.services.embeddings import embed_text
 from app.services.guardrails import validate_input
 
 log = structlog.get_logger()
@@ -32,32 +35,15 @@ def _build_messages(
     ]
 
 
-async def generate_estimation(
-    description: str,
-    project_type: str,
-    detail_level: str,
-    output_format: str,
-    redis: aredis.Redis,
-) -> dict:
-    """Non-streaming: full validated EstimationResult in one call. For programmatic consumers.
-
-    Invariant: validate_input is ALWAYS first — before building messages and before cache lookup.
-    Only outputs that passed validation are cached.
-    """
-    # 1. Guardrails — MUST be first (invariant 16)
-    await validate_input(description)
-
-    # 2. Render prompt → messages
-    messages = _build_messages(description, project_type, detail_level, output_format)
-
-    # 3. Cache-aside structured completion
-    log.info("generating_estimation")
-    result, metadata, cache_hit = await cache.cached_complete_structured(
-        messages, EstimationResult, MAX_TOKENS, redis
+def _bucket(project_type: str, detail_level: str, output_format: str) -> str:
+    return cache.build_bucket_key(
+        PROMPT_VERSION, project_type, detail_level, output_format
     )
 
+
+def _map_to_response(result: dict, metadata: dict, cache_hit: bool) -> dict:
     return {
-        "result": result.model_dump(),
+        "result": result,
         "model": metadata["model"],
         "provider": metadata["provider"],
         "usage": metadata["usage"],
@@ -66,45 +52,111 @@ async def generate_estimation(
     }
 
 
+async def _validate_embed_and_lookup(
+    description: str,
+    project_type: str,
+    detail_level: str,
+    output_format: str,
+    semantic_cache: SemanticCache,
+) -> tuple[list[float], str, str | None]:
+    """Shared prefix for both entry points. Centralizes the ordering invariant:
+    guardrails FIRST, then embed ONCE (vector reused for lookup and write), then probe
+    the semantic cache. Returns (vector, bucket, cached_payload_or_None).
+    """
+    await validate_input(description)  # invariant: MUST be first
+    vector = await embed_text(description)  # once — reused for the write on miss
+    bucket = _bucket(project_type, detail_level, output_format)
+    cached = await cache.semantic_lookup(
+        semantic_cache, vector, bucket, enforce=get_settings().semantic_cache_enforce
+    )
+    return vector, bucket, cached
+
+
+async def generate_estimation(
+    description: str,
+    project_type: str,
+    detail_level: str,
+    output_format: str,
+    semantic_cache: SemanticCache,
+) -> dict:
+    """Non-streaming: full validated EstimationResult. For programmatic consumers.
+
+    Invariants:
+      - validate_input is ALWAYS first (before embedding, lookup and LLM).
+      - the embedding is computed ONCE and reused for lookup and write.
+      - only validated outputs are cached.
+    """
+    vector, bucket, cached = await _validate_embed_and_lookup(
+        description, project_type, detail_level, output_format, semantic_cache
+    )
+    if cached is not None:
+        payload = json.loads(cached)
+        return _map_to_response(payload["result"], payload["metadata"], cache_hit=True)
+
+    # Miss → LLM (Instructor validates + retries)
+    log.info("generating_estimation")
+    messages = _build_messages(description, project_type, detail_level, output_format)
+    result, metadata = await llm_wrapper.complete_structured(
+        messages, EstimationResult, MAX_TOKENS
+    )
+
+    # Write only after successful validation
+    payload = json.dumps({"result": result.model_dump(), "metadata": metadata})
+    await cache.semantic_write(semantic_cache, vector, bucket, description, payload)
+
+    return _map_to_response(result.model_dump(), metadata, cache_hit=False)
+
+
 async def generate_estimation_stream(
     description: str,
     project_type: str,
     detail_level: str,
     output_format: str,
+    semantic_cache: SemanticCache,
 ):
-    """Streaming: async generator of typed events. For programmatic/future use.
+    """Streaming: async generator of typed events. The UI consumes this endpoint.
 
-    Validators are inactive during streaming (Partial skips them).
-    Post-hoc validation fires when the stream closes; emits an error event on failure.
-    No cache (pending B5 — semantic cache with schema versioning).
+    On a cache HIT, emits the cached (validated) result as the final event.
+    On a MISS, streams Partial[EstimationResult] (validators inactive), then runs
+    POST-HOC validation when the stream closes; on success caches and emits done,
+    on failure emits an error event.
+
+    NOTE (PROVISIONAL): the exact in-stream validation mechanics are pending the live
+    session — this is the minimal version (accumulate partials, validate at the end).
     """
-    # 1. Guardrails — MUST be first (invariant 16)
-    await validate_input(description)
+    vector, bucket, cached = await _validate_embed_and_lookup(
+        description, project_type, detail_level, output_format, semantic_cache
+    )
+    if cached is not None:
+        payload = json.loads(cached)
+        yield {
+            "type": "done",
+            "result": payload["result"],
+            "metadata": {
+                **payload["metadata"],
+                "prompt_version": PROMPT_VERSION,
+                "cache_hit": True,
+            },
+        }
+        return
 
-    messages = _build_messages(description, project_type, detail_level, output_format)
+    # Miss → stream
     log.info("generating_estimation_stream")
+    messages = _build_messages(description, project_type, detail_level, output_format)
 
     accumulated: dict = {}
     metadata: dict = {}
 
-    try:
-        async for event in llm_wrapper.stream_structured(
-            messages, EstimationResult, MAX_TOKENS
-        ):
-            if event["type"] == "partial":
-                partial = event["data"]
-                # Yield token-like event with the partial object serialized
-                # (frontend uses /estimate non-stream; this path is for future use)
-                yield {"type": "partial", "data": partial.model_dump(exclude_unset=True)}
-                # Track latest partial for post-hoc validation
-                accumulated = partial.model_dump(exclude_unset=True)
-            elif event["type"] == "done":
-                metadata = event["metadata"]
+    async for event in llm_wrapper.stream_structured(
+        messages, EstimationResult, MAX_TOKENS
+    ):
+        if event["type"] == "partial":
+            accumulated = event["data"].model_dump(exclude_unset=True)
+            yield {"type": "partial", "data": accumulated}
+        elif event["type"] == "done":
+            metadata = event["metadata"]
 
-    except llm_wrapper.LLMError:
-        raise
-
-    # Post-hoc validation: construct final EstimationResult to fire validators
+    # 5. Post-hoc validation (Partial skipped the validators)
     try:
         final = EstimationResult(**accumulated)
     except Exception as exc:
@@ -112,11 +164,16 @@ async def generate_estimation_stream(
         yield {"type": "error", "data": f"Validation failed: {exc}"}
         return
 
+    # 6. Write only after successful validation
+    payload = json.dumps({"result": final.model_dump(), "metadata": metadata})
+    await cache.semantic_write(semantic_cache, vector, bucket, description, payload)
+
     yield {
         "type": "done",
+        "result": final.model_dump(),
         "metadata": {
             **metadata,
             "prompt_version": PROMPT_VERSION,
+            "cache_hit": False,
         },
-        "result": final.model_dump(),
     }

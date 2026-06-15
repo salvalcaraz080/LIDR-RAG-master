@@ -1,32 +1,35 @@
 import uuid
 from contextlib import asynccontextmanager
 
-import redis.asyncio as aredis
 import structlog
 from fastapi import FastAPI, Request
 
 from app.config import get_settings
 from app.logging_config import configure_logging
 from app.routers import estimations
+from app.services.cache import make_semantic_cache
 
 configure_logging()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: open the Redis client (lazy — real connection on first command).
+    # Startup: build the semantic cache once. The constructor connects to Redis Stack
+    # and creates the vector index (opens its own client via redis_url).
     settings = get_settings()
-    app.state.redis = aredis.from_url(
-        settings.REDIS_URL,
-        decode_responses=True, 
-    )
     log = structlog.get_logger()
-    log.info("redis_client_initialized", url=settings.REDIS_URL)
+    app.state.semantic_cache = make_semantic_cache(
+        settings.REDIS_URL, settings.SEMANTIC_CACHE_DISTANCE_THRESHOLD
+    )
+    log.info(
+        "semantic_cache_initialized",
+        url=settings.REDIS_URL,
+        distance_threshold=settings.SEMANTIC_CACHE_DISTANCE_THRESHOLD,
+    )
 
     yield  # ── app runs here ──
 
-    # Shutdown: close the connection pool cleanly.
-    await app.state.redis.aclose()
-    log.info("redis_client_closed")
+    # Shutdown: nothing to close explicitly — redisvl manages its own pool.
+    log.info("semantic_cache_shutdown")
 
 
 app = FastAPI(

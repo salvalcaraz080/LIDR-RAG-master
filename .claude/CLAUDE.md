@@ -9,7 +9,7 @@ Al portar el proyecto a otro dominio (futuro: RAG sobre ECSS), debe cambiarse el
 
 | Reutilizable / agnóstico de dominio | Dominio (cambia al portar) |
 |--------------------------------------|---------------------------|
-| `llm_wrapper`, `guardrails`, `cache`, logging, config | schemas, prompts, ejemplos, validadores de negocio |
+| `llm_wrapper`, `guardrails`, `embeddings`, `cache`, logging, config | schemas, prompts, ejemplos, validadores de negocio |
 
 Cualquier acoplamiento a proveedor debe quedar contenido en una sola pieza aislada.
 
@@ -51,7 +51,8 @@ El proyecto separa responsabilidades de forma estricta. Respetar esta separació
 - `app/services/` — lógica de negocio y adaptadores:
   - `llm_service.py` — orquesta la estimación: valida input (guardrails), pide el prompt al loader, llama a `cache`, mapea el resultado al dominio. Recibe primitivas tipadas, no el schema.
   - `guardrails.py` — validación de input **agnóstica de dominio**: moderation (litellm), heurística de inyección Markdown, social engineering. Respeta `GUARDRAILS_ENFORCE` (True en production → raise; False → log-only). `InputGuardrailError` es la excepción de dominio; el router la traduce a HTTP 400.
-  - `cache.py` — caché Redis (`cached_complete_structured`). Cache-aside sobre structured output: serializa `EstimationResult` como JSON (model_dump). Fallos de Redis se degradan a miss (no fatales).
+  - `cache.py` — **caché semántico** Redis (redisvl `SemanticCache`) **agnóstico de dominio**. Reescrito en B5: elimina el exact-match sha256 de S03. Clave compuesta = bucket (TAG filtrable determinista `prompt_version:project_type:detail_level:output_format`) + vector (embedding de la descripción). `semantic_lookup`/`semantic_write` reciben/devuelven strings opacos (el servicio (de)serializa `EstimationResult`+metadata) → cache NO menciona estimación. Modo log-only (`SEMANTIC_CACHE_ENFORCE=False`): hace lookup y loguea vecino+distancia pero devuelve None (no bypassa el LLM). Vector propio pasado a acheck/astore (sin vectorizer HF/torch: `CustomVectorizer` dummy solo fija dims=1536). Fallos de Redis → miss no fatal.
+  - `embeddings.py` — **agnóstico de dominio**, semilla del RAG (sesiones 7-8). `embed_text(text)` vía `litellm.aembedding` con `openai/text-embedding-3-small` (1536 dims). Acoplamiento a OpenAI contenido aquí. Solo embebe un string (no retrieval todavía).
   - `llm_wrapper.py` — adaptador LLM **agnóstico de dominio**. Usa `instructor.from_litellm(acompletion)` (AsyncInstructor). Expone `complete_structured` (one-shot, retries Instructor) y `stream_structured` (Partial streaming). Fallback OpenAI→Anthropic vía `fallbacks=["anthropic/..."]` kwarg (formato lista-de-strings; el formato dict del Router NO funciona aquí). Ver nota sobre trade-off vs Router.
 - `app/prompts/` — prompts versionados en templates Jinja2 (delimitadores Markdown). `loader.py` (`render_estimation_prompt`) renderiza `estimation/v1/{system.j2, user.j2, examples.j2}` y devuelve la tupla `(system, user)`. Recibe primitivas tipadas para mantenerse desacoplado del borde HTTP. `StrictUndefined`: toda variable del template debe estar en el contexto. Inyecta `out_of_scope_prefix` desde `OUT_OF_SCOPE_PREFIX` del schema.
 - `app/schemas/` — contratos Pydantic (request/response) con Enums tipados. Son el borde HTTP, no el núcleo.
@@ -60,7 +61,7 @@ El proyecto separa responsabilidades de forma estricta. Respetar esta separació
 - `app/context/` — datos de referencia estáticos. **Obsoleto en la fase CAG actual** (los ejemplos few-shot viven en `prompts/estimation/v1/examples.j2`); se reintroduce como fuente de datos en el módulo RAG.
 - `app/dependencies.py` — dependency providers de FastAPI.
 - `app/logging_config.py` — configura structlog una vez al arrancar.
-- `app/config.py` — `BaseSettings` con `GUARDRAILS_ENFORCE: bool | None` (None = derivado de APP_ENV: True en production, False en development).
+- `app/config.py` — `BaseSettings`. `GUARDRAILS_ENFORCE` y `SEMANTIC_CACHE_ENFORCE` (`bool | None`; None = derivado de APP_ENV: True en production, False/log-only en development). `EMBEDDING_MODEL` (`openai/text-embedding-3-small`). `SEMANTIC_CACHE_DISTANCE_THRESHOLD` (0.15, ≈0.85 similaridad, laxo a propósito).
 - `app/main.py` — punto de entrada: logging, lifespan (Redis), middleware, routers.
 
 ## Nota: Instructor vs Router (trade-off documentado)
@@ -95,26 +96,28 @@ PENDIENTE: tracker/métricas sobre logs de guardrails.
 
 ## Infraestructura de soporte
 
-- **Redis** — caché de respuestas LLM. Cliente gestionado vía `lifespan`, inyectado con `Depends(get_redis)`. TTL: 24 h.
+- **Redis Stack** — `redis/redis-stack` (NO `redis:alpine`): superconjunto con el motor de búsqueda vectorial que necesita `SemanticCache`. El `SemanticCache` se construye **una vez** en `lifespan` (crea el índice), se inyecta con `Depends(get_semantic_cache)`. Abre su propio cliente vía `redis_url` (los bytes binarios del vector son incompatibles con `decode_responses=True`). TTL: 24 h.
 - **structlog** — logging estructurado con `request_id` y `path` por request.
 
 ## Flujo de una request (`POST /api/v1/estimate`)
 
 ```
 Router → valida EstimationRequest (description + project_type/detail_level/output_format)
-       → desempaqueta en primitivas + inject redis (Depends)
+       → desempaqueta en primitivas + inject semantic_cache (Depends)
        → llm_service.generate_estimation(...)
-           → validate_input(description)        ← PRIMERO (Capa 2)
-           → render_estimation_prompt(...) → (system, user)
-           → messages = [system, user]
-           → cache.cached_complete_structured(messages, EstimationResult, max_tokens, redis)
-               → hit:  deserializa EstimationResult cacheado
-               → miss: llm_wrapper.complete_structured → Instructor retry → guarda en Redis
+           → validate_input(description)              ← PRIMERO (Capa 2, invariante)
+           → vector = embed_text(description)         ← UNA vez, reusado para lookup y write
+           → bucket = build_bucket_key(prompt_version, project_type, detail_level, output_format)
+           → cache.semantic_lookup(vector, bucket, enforce)
+               → hit (enforce): deserializa {result, metadata} cacheado → cache_hit=True
+               → miss / log-only: None
+           → miss: render_estimation_prompt → messages → llm_wrapper.complete_structured (Instructor retry)
+                   → cache.semantic_write(vector, bucket, description, payload)  ← solo tras validación OK
            → mapea a dict plano {result, model, provider, usage, cache_hit, prompt_version}
        → EstimationResponse(**result)  ← validación Pydantic en el borde
 ```
 
-El endpoint `/estimate/stream` no usa caché (pendiente B5).
+**Ambos endpoints** usan el cache semántico (B5). El streaming (`/estimate/stream`, que la UI consume SIEMPRE): HIT emite el resultado cacheado como evento `done`; MISS streamea Partials, valida post-hoc al cerrar y cachea. La mecánica de validación-en-stream es PROVISIONAL (pendiente sesión en vivo).
 
 ## Convenciones del proyecto
 
@@ -122,7 +125,8 @@ El endpoint `/estimate/stream` no usa caché (pendiente B5).
 - **`validate_input` es la PRIMERA operación del servicio** (invariante: antes de construir mensajes y antes del cache lookup; solo se cachean outputs que pasaron validación).
 - **El prompt vive en templates Jinja2 versionados (`app/prompts/`), no en f-strings.**
 - **El loader recibe primitivas tipadas, no `EstimationRequest`.**
-- **`llm_wrapper` y `guardrails` NO mencionan "estimación"** — son agnósticos de dominio.
+- **`llm_wrapper`, `guardrails`, `embeddings` y `cache` NO mencionan "estimación"** — son agnósticos de dominio. El cache opera sobre strings opacos; el servicio (de)serializa el dominio.
+- **El embedding se computa UNA vez por request** y se reutiliza para lookup y write.
 - **`OUT_OF_SCOPE_PREFIX` en un único sitio** (`schemas/estimations.py`); lo importan validador y loader.
 - El archivo de schemas es `app/schemas/estimations.py` (plural). Import: `from app.schemas.estimations import ...`.
 - **Imports ordenados:** stdlib → terceros → locales.
@@ -136,13 +140,14 @@ El endpoint `/estimate/stream` no usa caché (pendiente B5).
 
 ## Pendientes
 
-- **Caché del endpoint de streaming** (`/estimate/stream`): no usa Redis. Se abordará en B5 (cacheo semántico + clave con schema-version).
-- **Clave de caché con prompt_version**: actualmente la clave es sha256(messages+model+max_tokens). Un cambio de schema/prompt invalida la caché de facto (el prompt renderizado cambia). Formalizar incluyendo `prompt_version` en la clave es deuda de B5.
+- **Validación-en-stream**: la mecánica exacta (validar Partials a mitad de stream vs post-hoc al cerrar) es PROVISIONAL, pendiente de la sesión en vivo. Implementado el mínimo: acumular partials + validar al final. El frontend la marca con TODO.
 - **Tracker/métricas de guardrails**: los disparos se loguean con structlog; falta un dashboard/agregador.
+- **Tracker de hit-rate del cache semántico**: en modo log-only se loguea (input, vecino top-1, distancia); falta un agregador para calibrar el `distance_threshold` con datos reales.
 
 ## Restricciones
 
 - No reproducir credenciales ni valores del `.env` en código, logs ni respuestas.
-- No introducir RAG, embeddings, base de datos vectorial ni persistencia todavía: el proyecto está en fase CAG.
+- Embeddings permitidos SOLO para el cache semántico (`embeddings.py`). NO introducir RAG/retrieval, base de datos vectorial como feature, ni persistencia de dominio todavía: el proyecto sigue en fase CAG (los embeddings son la semilla del RAG, no el RAG).
 - No añadir dependencias sin reflejarlas vía `uv add`.
 - No usar `instructor.patch(Router(...))` — bug conocido de carryover de params.
+- No usar el vectorizer HF local de redisvl (mete torch). Computar el vector vía `litellm.aembedding` y pasarlo a acheck/astore con `vector=`.

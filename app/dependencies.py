@@ -1,7 +1,7 @@
 from fastapi import Request
-import redis.asyncio as aredis
+from redisvl.extensions.cache.llm import SemanticCache
 
 
-def get_redis(request: Request) -> aredis.Redis:
-    """Dependency provider: hands the app-wide Redis client to endpoints."""
-    return request.app.state.redis
+def get_semantic_cache(request: Request) -> SemanticCache:
+    """Dependency provider: hands the app-wide semantic cache to endpoints."""
+    return request.app.state.semantic_cache
