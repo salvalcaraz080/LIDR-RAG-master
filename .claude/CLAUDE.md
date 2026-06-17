@@ -117,7 +117,7 @@ Router → valida EstimationRequest (description + project_type/detail_level/out
        → EstimationResponse(**result)  ← validación Pydantic en el borde
 ```
 
-**Ambos endpoints** usan el cache semántico (B5). El streaming (`/estimate/stream`, que la UI consume SIEMPRE): HIT emite el resultado cacheado como evento `done`; MISS streamea Partials, valida post-hoc al cerrar y cachea. La mecánica de validación-en-stream es PROVISIONAL (pendiente sesión en vivo).
+**Ambos endpoints** usan el cache semántico (B5). El **principal es `/estimate` (no-stream)**, que es el que consume la UI: devuelve el `EstimationResult` validado completo de una vez. El streaming (`/estimate/stream`) se **CONSERVA** como secundario (referencia/reutilización para otros proyectos), no lo usa la UI: HIT emite el cacheado como evento `done`; MISS streamea Partials, valida post-hoc al cerrar y cachea. La mecánica de validación-en-stream quedó como PROVISIONAL.
 
 ## Convenciones del proyecto
 
@@ -131,6 +131,16 @@ Router → valida EstimationRequest (description + project_type/detail_level/out
 - El archivo de schemas es `app/schemas/estimations.py` (plural). Import: `from app.schemas.estimations import ...`.
 - **Imports ordenados:** stdlib → terceros → locales.
 - API versionada con prefijo `/api/v1`.
+
+## Documentación del código (comentarios)
+
+El código debe poder entenderse **leyendo solo los comentarios**, sin parsear la lógica.
+
+- **Comentarios agrupados, no línea a línea**: un comentario encabeza un bloque de líneas relacionadas y resume QUÉ hace ese bloque.
+- **Resumir, no narrar**: explica la intención del bloque; no repitas literalmente lo que ya dice el código (`# incrementa i` sobre `i += 1` está prohibido).
+- **El porqué cuando no es obvio**: si una línea hace algo no evidente (workaround, invariante, decisión de diseño), el comentario explica el motivo.
+- **Docstring por módulo/función** para el contrato (qué recibe, qué devuelve, invariantes); comentarios inline para los pasos internos.
+- Idioma: comentarios en español (consistente con el resto del proyecto); el código y los nombres, en inglés.
 
 ## Git
 

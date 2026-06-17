@@ -136,54 +136,43 @@ Es un **servicio separado** del backend: su propio contenedor, su propio grupo d
   `output_format`). Los labels son legibles, pero el valor enviado es **exactamente** el value del Enum
   del backend (case-sensitive — el backend corre en Linux).
 - Validar longitud mínima de la descripción (20 caracteres) **antes** de llamar al backend.
-- Consumir **SIEMPRE** el endpoint de **streaming** vía SSE (el no-stream se reserva para consumidores
-  programáticos) y renderizar el resultado estructurado al cerrar el stream.
+- Consumir el endpoint **principal `/estimate` (no-stream)** y renderizar el `EstimationResult` completo.
 
-### Patrón clave: puente SSE con Partials estructurados
+### Patrón: petición no-stream
 
-A diferencia de S03 (que streameaba tokens de prosa), el backend ahora emite **Partial[EstimationResult]
-estructurado**. El frontend tiene un generador puente (`stream_estimation`) que parsea los eventos SSE
-con `sseclient-py` y entrega tuplas `(event_type, data)`:
+Tras la sesión en vivo se decidió continuar con respuestas **no-stream**: el frontend hace un único
+`POST /estimate`, espera la respuesta completa (`EstimationResponse`) y la pinta. El puente SSE de
+streaming se retiró del frontend; el **endpoint de streaming se conserva en el backend** (referencia /
+reutilización para otros proyectos), simplemente la UI ya no lo usa.
 
 ```mermaid
 sequenceDiagram
     participant U as Usuario
     participant S as Streamlit
-    participant G as stream_estimation()<br/>(puente SSE)
-    participant B as Backend /estimate/stream
+    participant B as Backend /estimate
 
     U->>S: rellena formulario (description + params)
     S->>S: valida longitud ≥ 20
-    S->>G: for event_type, data in stream_estimation(payload)
-    G->>B: POST {...} (stream=True, Accept: text/event-stream)
-    loop por cada evento SSE
-        B-->>G: event: partial / done / error
-        alt partial
-            G-->>S: dict parcial → indicador de progreso (nº fases)
-        else done
-            G-->>S: {result, metadata{cache_hit}} → render final
-        else error
-            G-->>S: {error} → st.error
-        end
+    S->>B: POST {description, project_type, detail_level, output_format}
+    alt 200 OK
+        B-->>S: EstimationResponse {result, model, provider, usage, cache_hit, prompt_version}
+        S->>U: tabla/narrativa + métricas + línea de metadatos
+    else 400 (guardrail enforce)
+        B-->>S: {detail}
+        S->>U: "Solicitud rechazada: …"
+    else conexión fallida
+        S->>U: "No se pudo conectar con el backend…"
     end
-    S->>U: tabla/narrativa + línea de metadatos (cache hit/miss)
 ```
 
-El frontend **no hace render progresivo** (redibujar la tabla en cada Partial parpadea en Streamlit):
-muestra un contador de fases recibidas mientras llega el stream y pinta el resultado completo al recibir
-`done`. Un HIT de caché emite `done` directamente; un MISS valida post-hoc al cerrar y, si falla, emite
-`error`.
-
-> **PROVISIONAL** (pendiente sesión en vivo): cómo presentar un fallo de validación a mitad de stream.
-> El streaming (`create_partial`) **no reintenta** como el no-stream; por eso el prompt prohíbe
-> explícitamente salidas inválidas (p. ej. fases de 0 semanas) que el path no-stream sí salvaría con los
-> retries de Instructor.
+El caso degradado out-of-scope (summary con prefijo / confidence 0 / sin fases) se muestra como aviso,
+sin tabla ni métricas.
 
 ### Manejo de errores
 
-- **Backend caído / no-2xx antes del stream** (p. ej. `422` de validación) → `RequestException`,
-  mensaje "¿Está levantado?".
-- **Fallo del backend a mitad de generación** → llega como evento SSE `error`, se muestra como aviso.
+- **Input rechazado por guardrails** (enforce) → `HTTP 400` → "Solicitud rechazada: …".
+- **Fallo del backend** (`5xx`) → "Error del backend: …".
+- **Backend inaccesible** (caído / URL mal configurada) → `RequestException` → "¿Está levantado?".
 
 La URL del backend se configura con `BACKEND_URL` ([`frontend/config.py`](frontend/config.py)), con
 default `http://estimator:8000` (el nombre del servicio en Compose). Para correr Streamlit en local
@@ -201,8 +190,8 @@ traduce el resultado/errores a HTTP. **No contiene lógica de negocio.**
 
 | Método | Ruta | Respuesta | Caché | Uso |
 |--------|------|-----------|-------|-----|
-| `POST` | `/api/v1/estimate` | `EstimationResponse` (JSON) | ✅ semántico | Consumidores programáticos |
-| `POST` | `/api/v1/estimate/stream` | SSE (`EventSourceResponse`) | ✅ semántico | UI (la consume SIEMPRE) |
+| `POST` | `/api/v1/estimate` | `EstimationResponse` (JSON) | ✅ semántico | **PRINCIPAL — lo consume la UI** |
+| `POST` | `/api/v1/estimate/stream` | SSE (`EventSourceResponse`) | ✅ semántico | Secundario — conservado (referencia/reutilización) |
 | `GET`  | `/health` | `{"status": "healthy"}` | — | Health check (Docker/orquestador) |
 
 ### Patrón de delegación
