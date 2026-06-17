@@ -18,6 +18,7 @@ async def embed_text(text: str) -> list[float]:
 
     litellm.aembedding returns a dict-shaped response: data[0]["embedding"].
     """
+    # Único punto de acoplamiento a OpenAI (vía litellm). Devuelve el vector de 1536 dims.
     model = get_settings().EMBEDDING_MODEL
     response = await litellm.aembedding(model=model, input=text)
     return response.data[0]["embedding"]

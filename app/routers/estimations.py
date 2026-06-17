@@ -19,11 +19,12 @@ async def create_estimation(
     request: EstimationRequest,
     semantic_cache: SemanticCache = Depends(get_semantic_cache),
 ) -> EstimationResponse:
-    """Non-streaming estimation — full validated structured response.
+    """Endpoint PRINCIPAL: estimación no-stream, respuesta estructurada completa.
 
-    For programmatic consumers. The UI uses /estimate/stream.
+    Es el que consume la UI. Devuelve el EstimationResult validado de una sola vez.
     """
     try:
+        # Desempaqueta el schema en primitivas y delega en el servicio (dominio).
         result = await generate_estimation(
             request.description,
             request.project_type.value,
@@ -31,12 +32,14 @@ async def create_estimation(
             request.output_format.value,
             semantic_cache,
         )
+    # Traducción de excepciones de dominio a HTTP (única capa que conoce códigos HTTP).
     except InputGuardrailError as exc:
         log.warning("estimation_guardrail_rejected", error=str(exc))
         raise HTTPException(status_code=400, detail=str(exc))
     except LLMError as exc:
         log.error("estimation_endpoint_error", error=str(exc))
         raise HTTPException(status_code=500, detail=str(exc))
+    # Validación Pydantic en el borde, sobre el dict plano del servicio.
     return EstimationResponse(**result)
 
 
@@ -45,13 +48,15 @@ async def create_estimation_stream(
     request: EstimationRequest,
     semantic_cache: SemanticCache = Depends(get_semantic_cache),
 ):
-    """Streaming estimation as SSE — consumed by the UI.
+    """Endpoint SECUNDARIO: estimación por streaming SSE. CONSERVADO, no lo usa la UI.
 
-    Emits 'partial' events while the model streams, then a single 'done' event
-    carrying the validated result + metadata (cache_hit). A cache hit emits 'done'
-    directly. Validation failure mid-stream emits an 'error' event.
+    Se mantiene como referencia/reutilización (otros proyectos). Emite eventos
+    'partial' mientras el modelo genera, luego un 'done' con el resultado validado +
+    metadata. Un HIT de caché emite 'done' directamente; un fallo de validación a
+    mitad de stream emite 'error'.
     """
     try:
+        # Reemite cada evento tipado del servicio como Server-Sent Event.
         async for event in generate_estimation_stream(
             request.description,
             request.project_type.value,
@@ -65,6 +70,7 @@ async def create_estimation_stream(
                 yield ServerSentEvent(data=event, event="done")
             elif event["type"] == "error":
                 yield ServerSentEvent(data={"error": event["data"]}, event="error")
+    # En SSE los errores no son códigos HTTP: se emiten como evento 'error'.
     except InputGuardrailError as exc:
         log.warning("stream_guardrail_rejected", error=str(exc))
         yield ServerSentEvent(data={"error": str(exc)}, event="error")

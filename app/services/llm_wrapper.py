@@ -76,6 +76,7 @@ def _model_from_chunks(chunks, default: str) -> str:
 
 def _extract_metadata(raw) -> dict:
     """Extract model/provider/usage from a litellm ModelResponse."""
+    # Modelo realmente usado (refleja el fallback si disparó) y su proveedor.
     actual_model = getattr(raw, "model", "unknown") or "unknown"
     provider = _resolve_provider(actual_model)
     usage = getattr(raw, "usage", None)
@@ -108,6 +109,8 @@ async def complete_structured(
     model = get_settings().LLM_MODEL
     log.info("llm_structured_call_started", model=model, response_model=response_model.__name__)
 
+    # create_with_completion devuelve (instancia validada, respuesta cruda). Instructor
+    # reintenta solo en fallo de validación Pydantic; fallbacks= cubre el fallo de proveedor.
     try:
         result, raw = await _instructor.chat.completions.create_with_completion(
             model=model,
@@ -117,6 +120,7 @@ async def complete_structured(
             max_retries=max_retries,
             fallbacks=_FALLBACK_MODELS,
         )
+    # Cualquier error del proveedor (tras agotar fallbacks/retries) se envuelve en LLMError.
     except Exception as exc:
         log.error("llm_structured_call_failed", error=str(exc))
         raise LLMError(f"LLM structured call failed: {exc}") from exc

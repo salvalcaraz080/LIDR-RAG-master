@@ -31,6 +31,7 @@ _MARKDOWN_INJECTION_PATTERNS: list[re.Pattern] = [
     re.compile(r"^#{1,3}\s+additional\s+detail", re.IGNORECASE | re.MULTILINE),
 ]
 
+# Frases típicas de prompt-injection / jailbreak que intentan reescribir el comportamiento.
 _SOCIAL_ENGINEERING_PATTERNS: list[re.Pattern] = [
     re.compile(r"ignore (all |previous |above )?instructions?", re.IGNORECASE),
     re.compile(r"disregard (all |previous |above )?instructions?", re.IGNORECASE),

@@ -46,7 +46,9 @@ def make_semantic_cache(redis_url: str, distance_threshold: float) -> SemanticCa
     Opens its own redis connection via redis_url: redisvl needs raw bytes for the
     vector field, which is incompatible with the app's decode_responses=True client.
     """
+    # Vectorizer dummy: solo fija dims=1536 en el schema; nunca se invoca (pasamos vector=).
     dummy = CustomVectorizer(embed=lambda _text: [0.0] * EMBEDDING_DIMS)
+    # filterable_fields define el TAG "bucket" por el que filtramos en los lookups.
     return SemanticCache(
         name=CACHE_INDEX_NAME,
         redis_url=redis_url,
@@ -74,6 +76,7 @@ async def semantic_lookup(
     enforce=False (log-only): logs the nearest neighbor + distance but returns None,
     so the caller does NOT bypass the LLM.
     """
+    # Busca el vecino más cercano dentro del bucket; fallo de Redis → miss no fatal.
     try:
         hits = await cache.acheck(
             vector=vector,
@@ -84,6 +87,7 @@ async def semantic_lookup(
         log.warning("semantic_cache_lookup_failed", error=str(exc))
         return None
 
+    # Sin vecino dentro del umbral de distancia → miss.
     if not hits:
         log.info("semantic_cache_miss", bucket=bucket)
         return None

@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field, model_validator
 OUT_OF_SCOPE_PREFIX = "Out of scope:"
 
 
+# Parámetros tipados del formulario (Enums str → el JSON viaja con el value exacto).
 class ProjectType(str, Enum):
     mobile_app = "mobile_app"
     web_saas = "web_saas"
@@ -26,6 +27,7 @@ class OutputFormat(str, Enum):
 
 
 class Phase(BaseModel):
+    # Una fase del proyecto. duration_weeks ≥ 1 (nunca 0); el LLM define estos valores.
     name: str
     duration_weeks: int = Field(ge=1, le=52)
     cost_eur: int = Field(ge=0)
@@ -44,6 +46,8 @@ class EstimationResult(BaseModel):
 
     @model_validator(mode="after")
     def total_must_match_sum_of_phases(self) -> "EstimationResult":
+        # La aritmética es nuestra, no del LLM: computamos los totales como suma exacta
+        # de las fases (los sobreescribimos). Sin fases (out-of-scope) se conservan en 0.
         if not self.phases:
             return self
         self.total_duration_weeks = sum(p.duration_weeks for p in self.phases)
@@ -52,6 +56,8 @@ class EstimationResult(BaseModel):
 
     @model_validator(mode="after")
     def low_confidence_must_be_explicit(self) -> "EstimationResult":
+        # Coherencia: una confianza muy baja obliga a marcar explícitamente out-of-scope
+        # (si no, Instructor reintenta). Evita estimaciones "fantasma" con confianza ínfima.
         if self.confidence_pct < 30 and not self.summary.startswith(OUT_OF_SCOPE_PREFIX):
             raise ValueError(
                 f"confidence_pct={self.confidence_pct} is below 30 but summary does "
@@ -68,6 +74,7 @@ class TokenUsage(BaseModel):
 
 
 class EstimationResponse(BaseModel):
+    # Contrato de salida: el resultado de dominio + metadatos de observabilidad/caché.
     result: EstimationResult
     model: str
     provider: str
@@ -79,6 +86,8 @@ class EstimationResponse(BaseModel):
 class EstimationRequest(BaseModel):
     """Incoming request: a project description plus typed estimation parameters."""
 
+    # description: texto libre acotado (20–2000); los 3 parámetros son Enums tipados.
+    # Una longitud o un Enum inválidos → 422 automático antes de tocar el negocio.
     description: str = Field(
         ..., min_length=20, max_length=2000, description="Project description to estimate"
     )

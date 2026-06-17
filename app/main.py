@@ -43,6 +43,8 @@ app = FastAPI(
 @app.middleware("http")
 async def bind_request_context(request: Request, call_next):
     """Bind a unique request_id so every log in this request carries it."""
+    # Limpia el contexto previo y bindea request_id + path: toda traza de esta petición
+    # queda correlacionada (lo recoge merge_contextvars en logging_config).
     structlog.contextvars.clear_contextvars()
     structlog.contextvars.bind_contextvars(
         request_id=str(uuid.uuid4())[:8],
@@ -51,11 +53,13 @@ async def bind_request_context(request: Request, call_next):
     return await call_next(request)
 
 
+# Monta los endpoints de estimación (/api/v1/...).
 app.include_router(estimations.router)
 
 
 @app.get("/health")
 async def health():
+    # Health check para Docker/orquestador: no toca dependencias.
     return {"status": "healthy"}
 
 

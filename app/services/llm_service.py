@@ -22,6 +22,7 @@ def _build_messages(
     detail_level: str,
     output_format: str,
 ) -> list[dict]:
+    # Renderiza el prompt versionado y lo empaqueta como mensajes system+user separados.
     system, user = render_estimation_prompt(
         description=description,
         project_type=project_type,
@@ -36,12 +37,14 @@ def _build_messages(
 
 
 def _bucket(project_type: str, detail_level: str, output_format: str) -> str:
+    # Partición determinista de la caché: incluye prompt_version (un bump invalida de facto).
     return cache.build_bucket_key(
         PROMPT_VERSION, project_type, detail_level, output_format
     )
 
 
 def _map_to_response(result: dict, metadata: dict, cache_hit: bool) -> dict:
+    # Aplana el resultado de dominio + metadatos al shape que espera EstimationResponse.
     return {
         "result": result,
         "model": metadata["model"],
