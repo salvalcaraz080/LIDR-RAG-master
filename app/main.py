@@ -1,3 +1,4 @@
+import time
 import uuid
 from contextlib import asynccontextmanager
 
@@ -42,7 +43,7 @@ app = FastAPI(
 
 @app.middleware("http")
 async def bind_request_context(request: Request, call_next):
-    """Bind a unique request_id so every log in this request carries it."""
+    """Bindea el contexto del request y emite un access-log con latencia y status."""
     # Limpia el contexto previo y bindea request_id + path: toda traza de esta petición
     # queda correlacionada (lo recoge merge_contextvars en logging_config).
     structlog.contextvars.clear_contextvars()
@@ -50,7 +51,28 @@ async def bind_request_context(request: Request, call_next):
         request_id=str(uuid.uuid4())[:8],
         path=request.url.path,
     )
-    return await call_next(request)
+    log = structlog.get_logger()
+
+    # Cronometra la petición. Un fallo no controlado se loguea con traceback y se re-lanza.
+    start = time.perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception:
+        duration_ms = round((time.perf_counter() - start) * 1000, 1)
+        log.exception("request_failed", method=request.method, duration_ms=duration_ms)
+        raise
+
+    # Access-log: una línea por petición con método, status y latencia (clave para análisis).
+    # Se omite /health (cada 30s desde Docker) para no inundar los logs.
+    duration_ms = round((time.perf_counter() - start) * 1000, 1)
+    if request.url.path != "/health":
+        log.info(
+            "request_completed",
+            method=request.method,
+            status_code=response.status_code,
+            duration_ms=duration_ms,
+        )
+    return response
 
 
 # Monta los endpoints de estimación (/api/v1/...).

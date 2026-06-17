@@ -584,6 +584,13 @@ Esto garantiza un único índice/instancia por proceso, creado en el momento ade
 - El **middleware `bind_request_context`** (en `main.py`) genera un `request_id` único (8 chars) y
   bindea `request_id` + `path` al inicio de cada request. Resultado: **toda** traza de una misma
   petición es correlacionable.
+- **Access-log por request**: el mismo middleware cronometra la petición y emite `request_completed`
+  con `method`, `status_code` y `duration_ms` (se omite `/health`). Un fallo no controlado se loguea
+  como `request_failed` con traceback y se re-lanza. Clave para análisis de latencia y tasa de error.
+- **Latencia del modelo aislada**: `llm_structured_call_completed` lleva `duration_ms` (además de
+  tokens/retries), lo que permite separar el tiempo del LLM del resto (embedding, caché, render).
+- **Tracebacks estructurados** en producción (`dict_tracebacks`): las excepciones viajan como árbol
+  dentro del JSON. En desarrollo `ConsoleRenderer` ya pinta la excepción de forma legible.
 - **Renderer según entorno**: `ConsoleRenderer` legible en desarrollo; `JSONRenderer` en producción
   (apto para agregadores de logs). Driven por `APP_ENV` y `LOG_LEVEL`.
 

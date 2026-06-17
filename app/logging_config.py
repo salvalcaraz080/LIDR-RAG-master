@@ -24,14 +24,16 @@ def configure_logging() -> None:
     ]
 
     # Renderer según entorno: JSON (agregable) en producción, consola legible en desarrollo.
+    # En producción dict_tracebacks convierte exc_info en un traceback estructurado dentro
+    # del JSON; en desarrollo ConsoleRenderer ya pinta la excepción de forma legible.
     if settings.APP_ENV == "production":
-        renderer = structlog.processors.JSONRenderer()
+        render_processors = [structlog.processors.dict_tracebacks, structlog.processors.JSONRenderer()]
     else:
-        renderer = structlog.dev.ConsoleRenderer()
+        render_processors = [structlog.dev.ConsoleRenderer()]
 
     # Filtra por nivel y cachea el logger (una sola configuración por proceso).
     structlog.configure(
-        processors=shared_processors + [renderer],
+        processors=shared_processors + render_processors,
         wrapper_class=structlog.make_filtering_bound_logger(log_level),
         cache_logger_on_first_use=True,
     )

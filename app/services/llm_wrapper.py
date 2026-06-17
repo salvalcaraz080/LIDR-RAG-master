@@ -18,6 +18,7 @@ Reason: instructor.from_litellm(acompletion) is the only stable integration path
 instructor.patch(Router) has a known bug (carryover of params between requests).
 """
 
+import time
 from typing import AsyncGenerator, TypeVar
 
 import instructor
@@ -111,6 +112,7 @@ async def complete_structured(
 
     # create_with_completion devuelve (instancia validada, respuesta cruda). Instructor
     # reintenta solo en fallo de validación Pydantic; fallbacks= cubre el fallo de proveedor.
+    start = time.perf_counter()
     try:
         result, raw = await _instructor.chat.completions.create_with_completion(
             model=model,
@@ -125,6 +127,8 @@ async def complete_structured(
         log.error("llm_structured_call_failed", error=str(exc))
         raise LLMError(f"LLM structured call failed: {exc}") from exc
 
+    # duration_ms aísla la latencia del modelo (vs embedding/cache) para análisis posterior.
+    duration_ms = round((time.perf_counter() - start) * 1000, 1)
     # Log how many retries Instructor needed (if it exposes it via the raw response)
     n_retries = getattr(raw, "_instructor_retry_count", None)
     metadata = _extract_metadata(raw)
@@ -135,6 +139,7 @@ async def complete_structured(
         input_tokens=metadata["usage"]["input_tokens"],
         output_tokens=metadata["usage"]["output_tokens"],
         retries=n_retries,
+        duration_ms=duration_ms,
     )
     return result, metadata
 
