@@ -9,7 +9,7 @@ Al portar el proyecto a otro dominio (futuro: RAG sobre ECSS), debe cambiarse el
 
 | Reutilizable / agnóstico de dominio | Dominio (cambia al portar) |
 |--------------------------------------|---------------------------|
-| `llm_wrapper`, `guardrails`, `embeddings`, `cache`, logging, config | schemas, prompts, ejemplos, validadores de negocio |
+| `llm_wrapper`, `guardrails`, `embeddings`, `cache`, `documents`, logging, config | schemas, prompts, ejemplos, validadores de negocio |
 
 Cualquier acoplamiento a proveedor debe quedar contenido en una sola pieza aislada.
 
@@ -53,6 +53,7 @@ El proyecto separa responsabilidades de forma estricta. Respetar esta separació
   - `guardrails.py` — validación de input **agnóstica de dominio**: moderation (litellm), heurística de inyección Markdown, social engineering. Respeta `GUARDRAILS_ENFORCE` (True en production → raise; False → log-only). `InputGuardrailError` es la excepción de dominio; el router la traduce a HTTP 400.
   - `cache.py` — **caché semántico** Redis (redisvl `SemanticCache`) **agnóstico de dominio**. Reescrito en B5: elimina el exact-match sha256 de S03. Clave compuesta = bucket (TAG filtrable determinista `prompt_version:project_type:detail_level:output_format`) + vector (embedding de la descripción). `semantic_lookup`/`semantic_write` reciben/devuelven strings opacos (el servicio (de)serializa `EstimationResult`+metadata) → cache NO menciona estimación. Modo log-only (`SEMANTIC_CACHE_ENFORCE=False`): hace lookup y loguea vecino+distancia pero devuelve None (no bypassa el LLM). Vector propio pasado a acheck/astore (sin vectorizer HF/torch: `CustomVectorizer` dummy solo fija dims=1536). Fallos de Redis → miss no fatal.
   - `embeddings.py` — **agnóstico de dominio**, semilla del RAG (sesiones 7-8). `embed_text(text)` vía `litellm.aembedding` con `openai/text-embedding-3-small` (1536 dims). Acoplamiento a OpenAI contenido aquí. Solo embebe un string (no retrieval todavía).
+  - `documents.py` — **agnóstico de dominio**, semilla del pipeline de adjuntos RAG (sesiones 7-8). `extract_text(file_bytes, filename) -> str`. Dispatch por extensión (`.pdf`, `.docx`). Síncrono (CPU-bound puro); quien lo llame en async debe usar `asyncio.to_thread`. `DocumentExtractionError` envuelve excepciones de pypdf/python-docx. Guarda de texto vacío: nunca devuelve string vacío silencioso. No cableado al flujo de estimación todavía.
   - `llm_wrapper.py` — adaptador LLM **agnóstico de dominio**. Usa `instructor.from_litellm(acompletion)` (AsyncInstructor). Expone `complete_structured` (one-shot, retries Instructor) y `stream_structured` (Partial streaming). Fallback OpenAI→Anthropic vía `fallbacks=["anthropic/..."]` kwarg (formato lista-de-strings; el formato dict del Router NO funciona aquí). Ver nota sobre trade-off vs Router.
 - `app/prompts/` — prompts versionados en templates Jinja2 (delimitadores Markdown). `loader.py` (`render_estimation_prompt`) renderiza `estimation/v1/{system.j2, user.j2, examples.j2}` y devuelve la tupla `(system, user)`. Recibe primitivas tipadas para mantenerse desacoplado del borde HTTP. `StrictUndefined`: toda variable del template debe estar en el contexto. Inyecta `out_of_scope_prefix` desde `OUT_OF_SCOPE_PREFIX` del schema.
 - `app/schemas/` — contratos Pydantic (request/response) con Enums tipados. Son el borde HTTP, no el núcleo.

@@ -26,6 +26,7 @@ tanto *qué hace* como *por qué está construido así*.
    - [5.4 `prompts` — templates Jinja2](#54-prompts--templates-jinja2-versionados)
    - [5.5 `guardrails` — validación de input](#55-guardrails--validación-de-input-agnóstica-de-dominio)
    - [5.6 `embeddings` — vectores (semilla RAG)](#56-embeddings--vectores-semilla-del-rag)
+   - [5.7 `documents` — extracción de texto (semilla adjuntos RAG)](#57-documents--extracción-de-texto-semilla-adjuntos-rag)
 6. [Context — datos CAG](#6-context--datos-de-referencia-cag)
 7. [Infraestructura transversal](#7-infraestructura-transversal)
    - [7.1 Configuración](#71-configuración-appconfigpy)
@@ -306,6 +307,7 @@ flowchart LR
         em["embeddings.py<br/><b>embed_text</b><br/>litellm.aembedding"]
         ca["cache.py<br/><b>cache semántico</b><br/>redisvl · vector + bucket"]
         lw["llm_wrapper.py<br/><b>adaptador LLM</b><br/>Instructor + fallback"]
+        dc["documents.py<br/><b>extracción de texto</b><br/>bytes → str · PDF + DOCX"]
     end
     prompts["prompts/loader.py<br/>templates Jinja2 v1"]
 
@@ -480,6 +482,31 @@ contenido aquí.
 - Es la **semilla del módulo RAG** (sesiones 7-8): cuando llegue, este mismo módulo embeberá tanto los
   documentos a indexar como las queries de recuperación.
 - El servicio computa el embedding **una vez** por request y lo reutiliza para lookup y write del cache.
+
+### 5.7 `documents` — extracción de texto (semilla adjuntos RAG)
+
+[`app/services/documents.py`](app/services/documents.py). Módulo **agnóstico de dominio** y **síncrono**
+(CPU-bound puro, sin I/O): `extract_text(file_bytes, filename) -> str`. Convierte bytes de un documento
+en texto plano. No conoce HTTP, LLM, Redis ni el dominio de la aplicación.
+
+Es la **semilla del pipeline de adjuntos del módulo RAG** (sesiones 7-8): cuando llegue, este mismo
+módulo procesará los documentos a indexar antes de chunking y embedding. Hoy vive junto a `embeddings`,
+`cache` y `llm_wrapper` como pieza reutilizable, **sin cable al flujo de estimación**.
+
+- **`SUPPORTED_EXTENSIONS`**: `frozenset({".pdf", ".docx"})`.
+- **`DocumentExtractionError`**: excepción de dominio del módulo (tipo no soportado, bytes corruptos, texto
+  vacío). Envuelve las excepciones internas de pypdf/python-docx para aislar el acoplamiento a las librerías.
+- **PDF** (`_extract_pdf`): `PdfReader(BytesIO(file_bytes))`; marcador `--- Page N ---` por cada página
+  con contenido (las páginas en blanco no generan marcador, dejando el texto vacío para que la guarda lo
+  detecte). `page.extract_text()` puede devolver `None` → tratado como `""`.
+- **DOCX** (`_extract_docx`): `Document(BytesIO(file_bytes))`; párrafos unidos con `\n`. Sin marcadores
+  de página (python-docx no expone saltos de página de forma fiable — asimetría documentada).
+- **Guarda de texto vacío**: si el texto extraído es vacío o solo whitespace → `DocumentExtractionError`
+  con hint de PDF escaneado sin OCR. El módulo nunca devuelve un string vacío silencioso.
+- **Sync a propósito**: quien lo llame desde una capa async debe ofrecerlo a un thread
+  (`asyncio.to_thread` / `run_in_threadpool`). Esa decisión es del cableado, no de este módulo.
+- **Logging**: `document_extracted` (éxito: `filename`, `extension`, `pages`, `chars`, `duration_ms`)
+  y `document_extraction_empty` / `document_extraction_unsupported` (fallo). Sin vocabulario de dominio.
 
 ---
 

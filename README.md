@@ -16,7 +16,8 @@ estimator/
 │   │   ├── guardrails.py   # Validacion de input (moderation + inyeccion)
 │   │   ├── embeddings.py   # embed_text via litellm (semilla del RAG)
 │   │   ├── cache.py        # Cache semantico (redisvl / Redis Stack)
-│   │   └── llm_wrapper.py  # Adaptador LLM (Instructor + fallback)
+│   │   ├── llm_wrapper.py  # Adaptador LLM (Instructor + fallback)
+│   │   └── documents.py    # Extraccion de texto de documentos (bytes -> str; semilla adjuntos RAG)
 │   ├── prompts/
 │   │   ├── loader.py       # Render de templates Jinja2 versionados
 │   │   └── estimation/v1/  # system.j2, user.j2, examples.j2
@@ -75,7 +76,7 @@ Plan para verificar toda la funcionalidad del backend. La consola es **PowerShel
 LLM, embeddings y cache estan mockeados; corren en milisegundos.
 
 ```powershell
-uv run pytest tests/ -v        # 32 tests (schemas, guardrails, cache, prompts, wrapper, health)
+uv run pytest tests/ -v        # 40 tests (schemas, guardrails, cache, prompts, wrapper, health, documents)
 uv run ruff check .            # lint
 ```
 
