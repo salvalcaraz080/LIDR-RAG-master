@@ -83,6 +83,12 @@ class EstimationResponse(BaseModel):
     prompt_version: str
 
 
+class SessionEstimationResponse(EstimationResponse):
+    """Conversational response: extiends EstimationResponse with session state."""
+    session_id: str
+    project_metadata: dict
+
+
 class EstimationRequest(BaseModel):
     """Incoming request: a project description plus typed estimation parameters."""
 

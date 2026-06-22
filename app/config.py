@@ -18,6 +18,8 @@ class Settings(BaseSettings):
     GUARDRAILS_ENFORCE: bool | None = None
     SEMANTIC_CACHE_DISTANCE_THRESHOLD: float = 0.15  # ~0.85 similarity, laxo a propósito
     SEMANTIC_CACHE_ENFORCE: bool | None = None
+    # Ventana deslizante del historial conversacional: pares user+assistant conservados.
+    MAX_TURNS: int = 6
 
     @property
     def guardrails_enforce(self) -> bool:

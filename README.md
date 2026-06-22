@@ -8,11 +8,12 @@ Servicio de estimacion de proyectos de software impulsado por IA, utilizando una
 estimator/
 ├── app/
 │   ├── main.py             # App FastAPI: lifespan (SemanticCache), middleware, routers
-│   ├── config.py           # Configuracion con Pydantic Settings
+│   ├── config.py           # Configuracion con Pydantic Settings (incl. MAX_TURNS)
 │   ├── routers/
-│   │   └── estimations.py  # POST /api/v1/estimate y /api/v1/estimate/stream (SSE)
+│   │   └── estimations.py  # POST /estimate, /estimate/stream, /sessions, /sessions/{id}/estimate
 │   ├── services/
-│   │   ├── llm_service.py  # Orquestacion del dominio (estimacion)
+│   │   ├── llm_service.py  # Orquestacion del dominio (estimacion + turno conversacional)
+│   │   ├── sessions.py     # Estado de sesion puro: historial, ProjectMetadata, ventana deslizante
 │   │   ├── guardrails.py   # Validacion de input (moderation + inyeccion)
 │   │   ├── embeddings.py   # embed_text via litellm (semilla del RAG)
 │   │   ├── cache.py        # Cache semantico (redisvl / Redis Stack)
@@ -20,11 +21,11 @@ estimator/
 │   │   └── documents.py    # Extraccion de texto de documentos (bytes -> str; semilla adjuntos RAG)
 │   ├── prompts/
 │   │   ├── loader.py       # Render de templates Jinja2 versionados
-│   │   └── estimation/v1/  # system.j2, user.j2, examples.j2
+│   │   └── estimation/v1/  # system.j2 (incl. ## Project Memory), user.j2, examples.j2
 │   └── schemas/
-│       └── estimations.py  # Modelos Pydantic (request/response)
+│       └── estimations.py  # Modelos Pydantic (request/response + SessionEstimationResponse)
 ├── frontend/
-│   └── streamlit_app.py    # UI: formulario + consumo del endpoint principal (no-stream)
+│   └── streamlit_app.py    # UI conversacional: sesion, adjuntos, panel de memoria del proyecto
 ├── tests/                  # pytest (sin coste de API; LLM/cache mockeados)
 ├── Dockerfile              # Build multi-stage con uv
 ├── docker-compose.yml      # backend + frontend + Redis Stack
@@ -76,7 +77,7 @@ Plan para verificar toda la funcionalidad del backend. La consola es **PowerShel
 LLM, embeddings y cache estan mockeados; corren en milisegundos.
 
 ```powershell
-uv run pytest tests/ -v        # 40 tests (schemas, guardrails, cache, prompts, wrapper, health, documents)
+uv run pytest tests/ -v        # tests (schemas, guardrails, cache, prompts, wrapper, health, documents, sessions)
 uv run ruff check .            # lint
 ```
 
@@ -170,5 +171,31 @@ docker compose restart estimator
 ```
 
 Quita esas dos lineas del `.env` para volver al modo log-only de desarrollo.
+
+### 8. Flujo conversacional (sesiones + adjuntos)
+
+**Crear sesión:**
+```powershell
+Invoke-RestMethod -Method Post http://localhost:8000/api/v1/sessions
+# -> { session_id = "<uuid>" }
+```
+
+**Turno conversacional** (multipart: campos Form + archivos opcionales):
+```powershell
+$sid = "<session_id>"
+Invoke-RestMethod -Method Post "http://localhost:8000/api/v1/sessions/$sid/estimate" `
+  -Form @{ transcript="A mobile app for yoga class booking with payments"; project_type="mobile_app"; detail_level="medium"; output_format="phases_table" }
+# Respuesta incluye result + session_id + project_metadata (memoria destilada)
+```
+
+**Adjuntos de extracción:** camino B (extracción local, sin OCR). Se usa `documents.py` (`pypdf` + `python-docx`) en un thread para no bloquear el event loop. El texto extraído se pasa al LLM en un fence XML `<attachment filename="...">` con el cierre sanitizado.
+
+**Memoria del proyecto:** actualizada tras cada turno por un LLM extractor (segunda llamada a `complete_structured` con `response_model=ProjectMetadata`). Solo el primer turno sin adjuntos puede resultar en cache hit.
+
+**Caché semántico:** solo aplica al primer turno sin adjuntos (semánticamente idéntico al turno único; comparte bucket con `/estimate`). Turno ≥ 2 o con adjuntos → siempre llama al LLM.
+
+**Ventana deslizante:** configurada por `MAX_TURNS=6` en `.env` o `Settings`. El historial completo se conserva en memoria; la ventana solo se aplica al construir el array de mensajes para la API.
+
+**TODO documentado:** decidir si el texto extraído de adjuntos pasa por `validate_input` (guardrails). Hoy la defensa es estructural (fence XML + sanitización del cierre `</attachment>`). Pasarlo por guardrails tiene riesgo de falsos positivos: una spec técnica legítima puede contener `## headers` que el detector de inyección Markdown marcaría como sospechosos.
 
 ---

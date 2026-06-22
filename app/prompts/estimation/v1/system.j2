@@ -80,4 +80,17 @@ recommended team. Keep it concise (3–5 sentences).
 - Reflect overall uncertainty in the top-level `confidence_pct`.
 {% endif %}
 
+{% if project_metadata %}
+## Project Memory
+
+Treat the following as established facts about the project under estimation.
+Do not contradict them unless the user explicitly revises them in the current turn.
+
+{% if project_metadata.project_name %}- Project name: {{ project_metadata.project_name }}{% endif %}
+{% if project_metadata.assumed_team_size %}- Assumed team size: {{ project_metadata.assumed_team_size }} full-time engineers{% endif %}
+{% if project_metadata.mentioned_technologies %}- Technologies: {{ project_metadata.mentioned_technologies | join(", ") }}{% endif %}
+{% if project_metadata.agreed_scope %}- Agreed scope: {{ project_metadata.agreed_scope }}{% endif %}
+{% if project_metadata.explicit_constraints %}- Constraints: {{ project_metadata.explicit_constraints | join("; ") }}{% endif %}
+{% if project_metadata.rejected_options %}- Rejected (do not propose again): {{ project_metadata.rejected_options | join("; ") }}{% endif %}
+{% endif %}
 {% include "estimation/v1/examples.j2" %}

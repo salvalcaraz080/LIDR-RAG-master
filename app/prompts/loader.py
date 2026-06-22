@@ -27,16 +27,18 @@ def render_estimation_prompt(
     detail_level: str,
     output_format: str,
     version: str = "v1",
+    project_metadata: dict | None = None,
 ) -> tuple[str, str]:
     """Render the estimation system and user prompts. Returns (system, user)."""
-    # Contexto del template: primitivas + el prefijo out-of-scope (definido en schemas,
-    # un único sitio). StrictUndefined obliga a que toda variable usada esté aquí.
+    # Contexto del template: primitivas + prefijo out-of-scope + memoria del proyecto.
+    # StrictUndefined obliga a que toda variable usada en el template esté aquí.
     context = {
         "description": description,
         "project_type": project_type,
         "detail_level": detail_level,
         "output_format": output_format,
         "out_of_scope_prefix": OUT_OF_SCOPE_PREFIX,
+        "project_metadata": project_metadata,  # None en turno único → bloque no se renderiza
     }
     # `version` selecciona la carpeta de templates (v1/, v2/…) sin tocar el resto del código.
     system = _env.get_template(f"estimation/{version}/system.j2").render(context)
